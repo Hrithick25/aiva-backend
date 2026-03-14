@@ -12,9 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class STTProcessor:
-    _SUPPORTED_LANGUAGES = {"en", "ta"}
+    _SUPPORTED_LANGUAGES = {"en", "ta", "hi"}
     # Tamil language codes that Whisper may return
     _TAMIL_CODES = {"ta", "tamil"}
+    # Hindi language codes that Whisper may return
+    _HINDI_CODES = {"hi", "hindi"}
 
     def __init__(self):
         """Initialize the STT processor."""
@@ -75,6 +77,9 @@ class STTProcessor:
             "ta": "ta",
             "ta-in": "ta",
             "tamil": "ta",
+            "hi": "hi",
+            "hi-in": "hi",
+            "hindi": "hi",
         }
         normalized = aliases.get(normalized, normalized)
         if normalized in self._SUPPORTED_LANGUAGES:
@@ -137,6 +142,7 @@ class STTProcessor:
             
             # Check if Tamil was detected
             is_tamil_input = detected_language in self._TAMIL_CODES
+            is_hindi_input = detected_language in self._HINDI_CODES
             
             # Also check for Tamil Unicode characters as a fallback signal
             if not is_tamil_input:
@@ -144,21 +150,34 @@ class STTProcessor:
                 if has_tamil_chars:
                     is_tamil_input = True
                     detected_language = "ta"
+
+            # Check for Hindi/Devanagari Unicode characters as a fallback signal
+            if not is_hindi_input and not is_tamil_input:
+                has_hindi_chars = any('\u0900' <= char <= '\u097f' for char in transcript_text)
+                if has_hindi_chars:
+                    is_hindi_input = True
+                    detected_language = "hi"
             
             # Normalize the final language code
-            final_language = "ta" if is_tamil_input else "en"
+            if is_tamil_input:
+                final_language = "ta"
+            elif is_hindi_input:
+                final_language = "hi"
+            else:
+                final_language = "en"
             
             # Confidence based on detection method
-            confidence = 0.92 if is_tamil_input else 0.95
+            confidence = 0.92 if (is_tamil_input or is_hindi_input) else 0.95
             
             logger.info(f"STT Result (single-pass) - Language: {final_language}, "
-                       f"Tamil: {is_tamil_input}, Text: '{transcript_text[:50]}...'")
+                       f"Tamil: {is_tamil_input}, Hindi: {is_hindi_input}, Text: '{transcript_text[:50]}...'")
             
             return {
                 "text": transcript_text,
                 "confidence": confidence,
                 "language": final_language,
                 "is_tamil": is_tamil_input,
+                "is_hindi": is_hindi_input,
                 "detected_language": detected_language,
             }
             

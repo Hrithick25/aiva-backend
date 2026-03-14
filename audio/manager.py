@@ -18,11 +18,13 @@ class AudioManager:
 
     @staticmethod
     def _detect_language(text: str) -> str:
-        """Detect language from text by checking for Tamil Unicode characters.
-        Returns 'ta' if Tamil script found, else 'en'."""
+        """Detect language from text by checking for Tamil / Hindi Unicode characters.
+        Returns 'ta' if Tamil script found, 'hi' if Devanagari found, else 'en'."""
         for char in text:
             if '\u0B80' <= char <= '\u0BFF':
                 return "ta"
+            if '\u0900' <= char <= '\u097F':
+                return "hi"
         return "en"
         
     async def process_audio_to_text(
@@ -248,24 +250,34 @@ class AudioManager:
                 "stt_confidence": 0.0
             }
 
+    async def stream_tts_to_websocket(self, text: str, language: str, websocket):
+        """Stream TTS audio directly to a WebSocket as binary frames.
+
+        Args:
+            text: Text to synthesize
+            language: Language code ("en", "ta", "hi")
+            websocket: FastAPI WebSocket instance
+        """
+        await self.tts_processor.stream_edge_tts(text, language, websocket)
+
     def get_supported_formats(self) -> Dict[str, Any]:
         """Get information about supported audio formats and capabilities"""
         return {
             "stt": {
                 "supported_formats": ["wav", "mp3", "ogg", "flac", "m4a"],
-                "languages": ["en", "ta"],
-                "max_duration": 300,  # seconds
-                "provider": "deepgram"
+                "languages": ["en", "ta", "hi"],
+                "max_duration": 300,
+                "provider": "groq_whisper"
             },
             "tts": {
-                "supported_formats": ["wav"],
-                "languages": ["en", "ta"],
-                "emotions": ["none", "happy", "sad"],
-                "provider": "gemini_tts"
+                "supported_formats": ["mp3"],
+                "languages": ["en", "ta", "hi"],
+                "emotions": ["none"],
+                "provider": "edge_tts"
             },
             "conversation_flow": {
                 "supports_realtime": False,
-                "supports_streaming": False,
+                "supports_streaming": True,
                 "supports_emotion_detection": True,
                 "api_key_rotation": True
             }

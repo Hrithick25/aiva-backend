@@ -23,13 +23,14 @@ WEBSOCKET_PORT = 8000
 AUDIO_SETTINGS = {
     # STT Settings (Groq)
     "stt_provider": "groq_whisper_v3",
+    "supported_languages": ["en", "ta", "hi"],
     "stt_language": os.getenv("STT_LANGUAGE", "auto"),  # auto, en, ta
     "max_audio_size": int(os.getenv("MAX_AUDIO_SIZE", "10485760")),  # 10MB default
     "max_audio_duration": int(os.getenv("MAX_AUDIO_DURATION", "300")),  # 5 minutes default
     
-    # TTS Settings (Gemini)
-    "tts_provider": "gemini_tts",
-    "default_voice": os.getenv("DEFAULT_VOICE", "Bard"),
+    # TTS Settings (Edge TTS)
+    "tts_provider": "edge_tts",
+    "default_voice": os.getenv("DEFAULT_VOICE", "en-US-AriaNeural"),
     "speech_rate": int(os.getenv("SPEECH_RATE", "150")),  # words per minute
     "default_tts_language": os.getenv("DEFAULT_TTS_LANGUAGE", "en"),
     

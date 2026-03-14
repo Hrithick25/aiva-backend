@@ -1,5 +1,4 @@
 fastapi
-deepgram-sdk
 uvicorn[standard]
 websockets
 chromadb
@@ -12,15 +11,12 @@ numpy
 faiss-cpu
 google-generativeai
 
-# Audio Processing Dependencies - New Providers
-groq                          # Groq API for STT (Whisper Large V3)
+# STT Provider
+groq
+
+# TTS Provider (Microsoft Edge TTS - no API key required)
 edge-tts
 
 # Audio processing utilities
 soundfile
 librosa
-
-# Optional: Fallback TTS providers (uncomment if needed)
-# edge-tts
-# pyttsx3 
-# google-cloud-texttospeech

@@ -98,7 +98,7 @@ async def get_audio_info():
             "tts_provider": AUDIO_SETTINGS["tts_provider"],
             "max_audio_size": AUDIO_SETTINGS["max_audio_size"],
             "max_duration": AUDIO_SETTINGS["max_audio_duration"],
-            "supported_languages": ["en", "ta"],
+            "supported_languages": ["en", "ta", "hi"],
             "api_key_rotation": AUDIO_SETTINGS["enable_key_rotation"]
         }
     }
