@@ -6,8 +6,6 @@ from typing import Any, Dict
 import io
 
 from groq import Groq
-
-from config.api_keys import get_groq_stt_key
 from .stt_post_processor import get_stt_post_processor
 
 logger = logging.getLogger(__name__)
@@ -25,7 +23,8 @@ class STTProcessor:
 
     def _get_client(self) -> Groq:
         """Create or reuse a Groq client, rotating when the key changes."""
-        api_key = get_groq_stt_key()
+        import os
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise Exception("No Groq API key available")
 
@@ -90,10 +89,23 @@ class STTProcessor:
         """
         try:
             client = self._get_client()
+
+            # Try to infer container/codec from headers for correct filename extension.
+            # Some providers use the filename to detect encoding.
+            detected_format = self._sniff_audio_format(audio_data)
             
             # Create a file-like object from audio bytes
             audio_file = io.BytesIO(audio_data)
-            audio_file.name = "audio.wav"
+            ext = {
+                "wav": "wav",
+                "mp3": "mp3",
+                "ogg": "ogg",
+                "flac": "flac",
+                "m4a": "m4a",
+                "webm": "webm",
+                "unknown": "wav",
+            }.get(detected_format, "wav")
+            audio_file.name = f"audio.{ext}"
             
             # Determine if we should force a specific language
             normalized_lang = self._normalize_language(language)
@@ -171,6 +183,7 @@ class STTProcessor:
                 b"OggS": "ogg",
                 b"fLaC": "flac",
                 b"ftypM4A": "m4a",
+                b"\x1a\x45\xdf\xa3": "webm",
             }
 
             audio_format = "unknown"
@@ -189,6 +202,31 @@ class STTProcessor:
                 "valid": False,
                 "error": str(error),
             }
+
+    def _sniff_audio_format(self, audio_data: bytes) -> str:
+        """Best-effort header sniffing for common audio containers."""
+        try:
+            if not audio_data or len(audio_data) < 4:
+                return "unknown"
+
+            headers = {
+                b"RIFF": "wav",
+                b"\xff\xfb": "mp3",
+                b"\xff\xf3": "mp3",
+                b"\xff\xf2": "mp3",
+                b"OggS": "ogg",
+                b"fLaC": "flac",
+                b"ftypM4A": "m4a",
+                b"\x1a\x45\xdf\xa3": "webm",
+            }
+
+            for header, fmt in headers.items():
+                if audio_data.startswith(header):
+                    return fmt
+
+            return "unknown"
+        except Exception:
+            return "unknown"
 
 
 _stt_processor = None

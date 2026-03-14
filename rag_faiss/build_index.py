@@ -1,18 +1,11 @@
-"""
-build_index.py – Read .txt sources, chunk them, embed via Gemini,
-build a FAISS HNSW index, and persist pickle + mapping files.
-
-Usage:
-    python -m rag_faiss.build_index
-"""
-
 import os
 import pickle
 import time
+from typing import Dict, List, Tuple
+
 import numpy as np
 import faiss
-import google.generativeai as genai
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import requests
 
 from rag_faiss.config import (
     GEMINI_API_KEY,
@@ -28,116 +21,118 @@ from rag_faiss.config import (
     EMBEDDING_MODEL,
 )
 
-# ── Gemini setup ─────────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_API_KEY)
-
 
 def _read_text_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
 
 
-def _embed_texts(texts: list[str], batch_size: int = 10) -> np.ndarray:
-    """Embed a list of texts using Gemini, respecting the free-tier 100 req/min limit."""
-    all_embeddings: list[list[float]] = []
-    requests_this_window = 0
-    window_start = time.time()
+def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    if not text:
+        return []
+    chunk_size = max(100, int(chunk_size))
+    overlap = max(0, int(overlap))
+    step = max(1, chunk_size - overlap)
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += step
+    return chunks
 
-        # If we're about to exceed 95 requests in this 60-second window, wait
-        if requests_this_window + len(batch) > 95:
-            elapsed = time.time() - window_start
-            wait = max(0, 62 - elapsed)
-            if wait > 0:
-                print(f"[INDEX] Rate limit pause: {wait:.0f}s ...")
-                time.sleep(wait)
-            requests_this_window = 0
-            window_start = time.time()
 
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=batch,
+EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL}:embedContent"
+
+
+def _embed_single(text: str) -> List[float]:
+    """Embed a single text using the Gemini REST API."""
+    resp = requests.post(
+        EMBED_URL,
+        params={"key": GEMINI_API_KEY},
+        json={"content": {"parts": [{"text": text}]}},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]["values"]
+
+
+def _embed_texts(texts: List[str]) -> np.ndarray:
+    vecs: List[List[float]] = []
+    for i, t in enumerate(texts):
+        vecs.append(_embed_single(t))
+        # Gemini free tier rate limit: ~1500 RPM, add small delay to be safe
+        if (i + 1) % 50 == 0:
+            print(f"  [embed] {i + 1}/{len(texts)} done, pausing briefly...")
+            time.sleep(1)
+    arr = np.asarray(vecs, dtype=np.float32)
+    faiss.normalize_L2(arr)
+    return arr
+
+
+def build_index() -> Tuple[int, int]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Set it in your backend .env before building the FAISS index."
         )
-        all_embeddings.extend(result["embedding"])
-        requests_this_window += len(batch)
 
-        done = min(i + batch_size, len(texts))
-        print(f"[INDEX] Embedded {done}/{len(texts)} chunks")
-
-        # Small pause between batches
-        if done < len(texts):
-            time.sleep(0.5)
-
-    return np.array(all_embeddings, dtype=np.float32)
-
-
-def build():
     os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
     os.makedirs(PICKLES_DIR, exist_ok=True)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
+    index_map: Dict[int, Tuple[str, int]] = {}
+    all_vectors: List[np.ndarray] = []
+    next_id = 0
+    total_chunks = 0
 
-    all_chunks: list[str] = []
-    index_map: dict[int, tuple[str, int]] = {}
-    global_id = 0
-
-    for source_name, file_path in KNOWLEDGE_FILES.items():
+    for name, file_path in KNOWLEDGE_FILES.items():
         if not os.path.exists(file_path):
-            print(f"[WARN] Skipping missing file: {file_path}")
+            print(f"[build_index] Skipping missing file: {file_path}")
             continue
 
-        raw_text = _read_text_file(file_path)
-        if not raw_text:
+        raw = _read_text_file(file_path)
+        chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+        if not chunks:
+            print(f"[build_index] No chunks for: {file_path}")
             continue
 
-        chunks = splitter.split_text(raw_text)
-        pickle_filename = f"{source_name}.pkl"
-
-        # Save chunk texts as a pickle
-        pickle_path = os.path.join(PICKLES_DIR, pickle_filename)
-        with open(pickle_path, "wb") as pf:
+        pickle_filename = f"{name}.pkl"
+        with open(os.path.join(PICKLES_DIR, pickle_filename), "wb") as pf:
             pickle.dump(chunks, pf)
 
-        # Register each chunk in the global map
-        for chunk_idx, chunk_text in enumerate(chunks):
-            index_map[global_id] = (pickle_filename, chunk_idx)
-            all_chunks.append(chunk_text)
-            global_id += 1
+        vecs = _embed_texts(chunks)
+        all_vectors.append(vecs)
 
-        print(f"[INDEX] {source_name}: {len(chunks)} chunks → {pickle_filename}")
+        for i in range(len(chunks)):
+            index_map[next_id] = (pickle_filename, i)
+            next_id += 1
 
-    if not all_chunks:
-        print("[INDEX] No chunks to index.")
-        return
+        total_chunks += len(chunks)
+        print(f"[build_index] {name}: {len(chunks)} chunks")
 
-    # ── Embed all chunks ─────────────────────────────────────────────
-    print(f"[INDEX] Embedding {len(all_chunks)} chunks via {EMBEDDING_MODEL} ...")
-    vectors = _embed_texts(all_chunks)
-    dim = vectors.shape[1]
-    print(f"[INDEX] Embedding dimension: {dim}")
+    if not all_vectors:
+        raise RuntimeError("No documents/chunks found. Check KNOWLEDGE_FILES paths.")
 
-    # ── Normalise for cosine similarity ──────────────────────────────
-    faiss.normalize_L2(vectors)
+    vectors = np.vstack(all_vectors)
+    dim = int(vectors.shape[1])
 
-    # ── Build HNSW index ─────────────────────────────────────────────
-    index = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
-    index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+    # Use IndexFlatIP (inner product = cosine similarity on L2-normalized vectors)
+    # Note: IndexHNSWFlat crashes on Windows/Python 3.8, and FlatIP provides
+    # exact search which is ideal for small datasets (<10K vectors)
+    index = faiss.IndexFlatIP(dim)
     index.add(vectors)
-    print(f"[INDEX] FAISS HNSW index built with {index.ntotal} vectors")
 
-    # ── Persist ──────────────────────────────────────────────────────
     faiss.write_index(index, FAISS_INDEX_PATH)
-    with open(INDEX_MAP_PATH, "wb") as mf:
-        pickle.dump(index_map, mf)
+    with open(INDEX_MAP_PATH, "wb") as f:
+        pickle.dump(index_map, f)
 
-    print(f"[INDEX] Saved index  → {FAISS_INDEX_PATH}")
-    print(f"[INDEX] Saved map    → {INDEX_MAP_PATH}")
-    print("[INDEX] Done.")
+    return total_chunks, index.ntotal
 
 
 if __name__ == "__main__":
-    build()
+    chunks, ntotal = build_index()
+    print(f"[build_index] ✅ Built FAISS index: {ntotal} vectors from {chunks} chunks")
+    print(f"[build_index] Index written to: {FAISS_INDEX_PATH}")
+    print(f"[build_index] Index map written to: {INDEX_MAP_PATH}")

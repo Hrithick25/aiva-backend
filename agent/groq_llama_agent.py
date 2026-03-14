@@ -15,31 +15,20 @@ from rag_faiss.retriever import retrieve as query_knowledge_base
 logger = logging.getLogger(__name__)
 
 # System prompt for Groq Llama agent
-SYSTEM_PROMPT = """You are a helpful AI assistant for Sri Eshwar College students. You provide accurate, specific answers using the provided context about:
+SYSTEM_PROMPT = """You are AIVA, a helpful AI assistant for Sri Eshwar College. Give accurate, specific answers using the provided context.
 
-- Hostel facilities, mess timings, and accommodation
-- Academic programs, departments, and courses  
-- Campus facilities and student services
-- Fee structure and admission information
-- College policies and procedures and marks
-- Cutoff marks for different departments and categories
-- General information about Sri Eshwar College
-
-IMPORTANT: When context is provided, use it to give specific, detailed answers with exact numbers, marks, or information. Don't give vague responses when you have specific data.
-
-RESPONSE FORMAT: Always respond in JSON format:
+RESPONSE FORMAT: Always respond in JSON:
 {
-    "response": "Your helpful answer with specific details from context",
+    "response": "Your concise answer (2-3 sentences max)",
     "emotion": "none" or "happy" or "sad"
 }
 
 GUIDELINES:
-- Be conversational and friendly
-- Use proper Indian English  
-- When you have specific context, provide exact details (numbers, marks, etc.)
-- If asking about cutoffs/marks, give the exact values from context
-- If you don't know something, say so honestly
-- For Tamil queries, respond in Tanglish"""
+- Keep responses SHORT and specific (2-3 sentences). Avoid long paragraphs.
+- When context has exact numbers/marks/fees, include them.
+- Be conversational and friendly.
+- If you don't know, say so honestly.
+- For Tamil queries: respond ONLY in Tamil script (தமிழ்). Do NOT use English or Tanglish."""
 
 
 # Cached Groq client (avoids creating a new client per request)
@@ -78,18 +67,28 @@ async def get_agent_response(user_query: str, language_context: Optional[Dict] =
     try:
         # Determine language instruction
         if language_context and language_context.get("is_tamil", False):
-            language_instruction = "User asked in Tamil. Respond in English with some Tamil phrases mixed in naturally."
+            language_instruction = "User asked in Tamil. You MUST respond in Tamil script (தமிழ்) only. Do NOT use English."
         else:
-            language_instruction = "User asked in English. Respond in clear English."
+            language_instruction = "User asked in English. Respond in clear, concise English."
         
         # Get relevant context from knowledge base (with timeout)
         # OPTIMIZED: Use get_running_loop() (not deprecated get_event_loop())
-        # and reduced timeout since FAISS + single embedding call should be fast
         try:
             loop = asyncio.get_running_loop()
+            
+            # For Tamil queries, create an English search version for better RAG results
+            # (embeddings were created from English documents)
+            rag_query = user_query
+            is_tamil_query = any('\u0B80' <= c <= '\u0BFF' for c in user_query)
+            if is_tamil_query:
+                # Append English keywords alongside Tamil to improve embedding match
+                # The Gemini embedding model handles multilingual input well
+                rag_query = f"[Tamil query] {user_query}"
+                logger.info(f"Tamil query detected, using bilingual RAG query")
+            
             rag_results = await asyncio.wait_for(
-                loop.run_in_executor(None, query_knowledge_base, user_query),
-                timeout=1.5  # Reduced from 2.0s — FAISS is sub-50ms, embedding is ~100-200ms
+                loop.run_in_executor(None, query_knowledge_base, rag_query),
+                timeout=3.0  # Increased from 1.5s — REST API embedding is slower than SDK
             )
             
             # Extract context properly from RAG results dictionary
@@ -133,8 +132,8 @@ Response (in JSON format):"""
             model="llama-3.1-8b-instant",  # Fastest Groq model for immediate responses
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,  # Lower temperature for faster, more focused responses
-            max_tokens=300,   # Reduced tokens for faster generation
-            top_p=0.9,        # Slightly lower top_p for speed
+            max_tokens=150,   # Short responses for fast TTS (~2-3 sentences)
+            top_p=0.9,
             stream=False
         )
         
@@ -218,7 +217,7 @@ Response (in JSON format):"""
         return parsed
         
     except Exception as error:
-        logger.error(f"Groq Llama agent error: {error}")
+        logger.exception("Groq Llama agent error")
         return {
             "response": "I apologize, but I'm experiencing technical difficulties. Please try again.",
             "emotion": "sad"

@@ -1,9 +1,10 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+
+# Always load the backend .env from the project root, regardless of where uvicorn is started.
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "data", "chroma_db")

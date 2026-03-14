@@ -11,6 +11,15 @@ router = APIRouter()
 audio_manager = get_audio_manager()
 
 
+def detect_language(text: str) -> str:
+    """Detect language from text by checking for Tamil Unicode characters.
+    Returns 'ta' if Tamil script found, else 'en'."""
+    for char in text:
+        if '\u0B80' <= char <= '\u0BFF':
+            return "ta"
+    return "en"
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -115,12 +124,23 @@ async def handle_text_query(ws: WebSocket, payload: dict):
     
     # Check if TTS is requested
     enable_tts = payload.get("enable_tts", False)
-    tts_language = payload.get("tts_language", "en")
     
-    # Get agent response
-    result = await get_agent_response(query)
+    # Detect Tamil in query text for proper language context
+    query_lang = detect_language(query)
+    language_context = {
+        "language": query_lang,
+        "is_tamil": query_lang == "ta",
+        "confidence": 1.0
+    }
+    
+    # Get agent response with language context
+    result = await get_agent_response(query, language_context)
     
     if enable_tts and result.get("response"):
+        # Auto-detect language from the actual response text
+        tts_language = detect_language(result["response"])
+        print(f"[WS] TTS language auto-detected: {tts_language}")
+        
         # Generate audio for the response
         tts_result = await audio_manager.process_text_to_audio(
             result["response"],
@@ -379,9 +399,9 @@ async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
         print(f"[WS] ✅ Text response sent immediately")
         
         # Step 5: TTS Processing - Single call for full text (OPTIMIZED)
-        # Previously: N separate API calls per sentence (~600ms each = N*600ms)
-        # Now: 1 API call for full text (~600-800ms total)
-        resolved_output_language = output_language if output_language in {"en", "ta"} else "en"
+        # Auto-detect language from actual response text (fixes Tamil responses using English TTS)
+        resolved_output_language = detect_language(response_text)
+        print(f"[WS] TTS language auto-detected from response: {resolved_output_language}")
         
         try:
             tts_start = time.time()
@@ -549,9 +569,10 @@ async def handle_tts_streaming(ws: WebSocket, payload: dict):
         })
 
 
-def split_text_into_sentences(text: str) -> list[str]:
+def split_text_into_sentences(text: str):
     """Split text into complete sentences for streaming TTS"""
     import re
+    from typing import List
     
     # Handle common abbreviations to avoid false splits
     text = text.replace("Mr.", "Mr").replace("Dr.", "Dr")

@@ -10,7 +10,10 @@ import os
 import pickle
 import numpy as np
 import faiss
-import google.generativeai as genai
+import requests
+
+from typing import Optional, Dict, Tuple, List
+import logging
 
 from rag_faiss.config import (
     GEMINI_API_KEY,
@@ -18,39 +21,47 @@ from rag_faiss.config import (
     INDEX_MAP_PATH,
     PICKLES_DIR,
     TOP_K,
-    HNSW_EF_SEARCH,
     EMBEDDING_MODEL,
 )
 
-# ── Gemini setup ─────────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_API_KEY)
+# ── Gemini Embedding REST API ────────────────────────────────────────
+EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL}:embedContent"
+
+logger = logging.getLogger(__name__)
 
 # ── Module-level singletons (loaded once) ────────────────────────────
-_faiss_index: faiss.Index | None = None
-_index_map: dict[int, tuple[str, int]] | None = None
-_pickle_cache: dict[str, list[str]] = {}
+_faiss_index: Optional[faiss.Index] = None
+_index_map: Optional[Dict[int, Tuple[str, int]]] = None
+_pickle_cache: Dict[str, List[str]] = {}
+_loaded_successfully: bool = False
 
 
 def _ensure_loaded():
-    """Load FAISS index and index map into memory on first call."""
-    global _faiss_index, _index_map
+    """Load FAISS index and index map into memory on first call.
+    Re-checks the filesystem until the index is successfully loaded."""
+    global _faiss_index, _index_map, _loaded_successfully
 
-    if _faiss_index is not None:
+    if _loaded_successfully:
         return
 
     if not os.path.exists(FAISS_INDEX_PATH):
-        raise FileNotFoundError(
-            f"FAISS index not found at {FAISS_INDEX_PATH}. Run build_index first."
+        logger.warning(
+            "FAISS index not found at %s. RAG will be disabled until the index is built.",
+            FAISS_INDEX_PATH,
         )
+        _faiss_index = None
+        _index_map = None
+        return
 
     _faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-    _faiss_index.hnsw.efSearch = HNSW_EF_SEARCH
 
     with open(INDEX_MAP_PATH, "rb") as f:
         _index_map = pickle.load(f)
 
+    _loaded_successfully = True
 
-def _load_pickle(pickle_filename: str) -> list[str]:
+
+def _load_pickle(pickle_filename: str) -> List[str]:
     """Load a pickle file, caching it for repeat access."""
     if pickle_filename not in _pickle_cache:
         path = os.path.join(PICKLES_DIR, pickle_filename)
@@ -60,12 +71,16 @@ def _load_pickle(pickle_filename: str) -> list[str]:
 
 
 def _embed_query(text: str) -> np.ndarray:
-    """Embed a single query string and normalise for cosine similarity."""
-    result = genai.embed_content(
-        model=EMBEDDING_MODEL,
-        content=text,
+    """Embed a single query string via REST API and normalise for cosine similarity."""
+    resp = requests.post(
+        EMBED_URL,
+        params={"key": GEMINI_API_KEY},
+        json={"content": {"parts": [{"text": text}]}},
+        timeout=15,
     )
-    vec = np.array([result["embedding"]], dtype=np.float32)
+    resp.raise_for_status()
+    values = resp.json()["embedding"]["values"]
+    vec = np.array([values], dtype=np.float32)
     faiss.normalize_L2(vec)
     return vec
 
@@ -81,12 +96,17 @@ def retrieve(query: str, top_k: int = TOP_K) -> dict:
         }
     """
     _ensure_loaded()
+    if _faiss_index is None or _index_map is None:
+        return {
+            "context": "",
+            "sources": [],
+        }
 
     query_vec = _embed_query(query)
     distances, ids = _faiss_index.search(query_vec, top_k)
 
-    chunks: list[str] = []
-    sources_seen: list[str] = []
+    chunks: List[str] = []
+    sources_seen: List[str] = []
 
     for faiss_id in ids[0]:
         if faiss_id == -1:

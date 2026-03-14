@@ -15,6 +15,15 @@ class AudioManager:
         """Initialize audio manager with STT and TTS processors"""
         self.stt_processor = get_stt_processor()
         self.tts_processor = get_tts_processor()
+
+    @staticmethod
+    def _detect_language(text: str) -> str:
+        """Detect language from text by checking for Tamil Unicode characters.
+        Returns 'ta' if Tamil script found, else 'en'."""
+        for char in text:
+            if '\u0B80' <= char <= '\u0BFF':
+                return "ta"
+        return "en"
         
     async def process_audio_to_text(
         self, 
@@ -204,7 +213,9 @@ class AudioManager:
             logger.info(f"Final response text for TTS: '{response_text[:50]}...'")
             
             # Step 3: Convert response to speech
-            resolved_output_language = output_language if output_language in {"en", "ta"} else "en"
+            # Auto-detect Tamil from response text instead of relying on output_language param
+            resolved_output_language = self._detect_language(response_text)
+            logger.info(f"TTS language auto-detected from response: {resolved_output_language}")
 
             tts_result = await self.process_text_to_audio(
                 response_text, 

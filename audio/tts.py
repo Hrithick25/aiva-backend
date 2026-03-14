@@ -11,9 +11,14 @@ from typing import Optional, Dict, Any, Union, List
 from io import BytesIO
 import json
 
-from google import genai
-from google.genai import types
-from config.api_keys import get_gemini_tts_key
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:  # pragma: no cover
+    genai = None
+    types = None
+
+import edge_tts
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,9 @@ class TTSProcessor:
         OPTIMIZED: Previously created a new genai.Client() on every TTS call,
         including SSL handshake overhead. Now caches and reuses the client.
         """
-        api_key = get_gemini_tts_key()
+        if genai is None:
+            raise Exception("google-genai is not installed; Gemini TTS is unavailable")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise Exception("No Gemini TTS API key available")
         
@@ -73,6 +80,15 @@ class TTSProcessor:
             Dict with audio data and metadata
         """
         try:
+            if genai is None or types is None:
+                return await self._synthesize_with_edge(text=text, language=language)
+
+            # For Tamil text, use edge-tts with native Tamil voice
+            # Gemini TTS Pulcherrima only speaks English well
+            if language == "ta":
+                logger.info("Tamil detected — routing to edge-tts with ta-IN-PallaviNeural")
+                return await self._synthesize_with_edge(text=text, language="ta")
+
             # Select voice based on language and emotion
             selected_voice = voice or self.voice_mapping.get((language, emotion), "Pulcherrima")
             
@@ -106,6 +122,49 @@ class TTSProcessor:
                 "audio_data": b"",
                 "format": "wav",
                 "provider": "gemini_tts"
+            }
+
+    async def _synthesize_with_edge(self, text: str, language: str = "en") -> Dict[str, Any]:
+        """Fallback TTS using edge-tts (no API key required)."""
+        try:
+            # Basic voice mapping. Prefer en-IN when possible for AIVA.
+            voice_map = {
+                "en": "en-IN-NeerjaNeural",
+                "ta": "ta-IN-PallaviNeural",
+            }
+            resolved_lang = (language or "en").strip().lower()
+            resolved_lang = resolved_lang if resolved_lang in voice_map else "en"
+            selected_voice = voice_map[resolved_lang]
+
+            communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+            audio_bytes = b""
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio" and chunk.get("data"):
+                    audio_bytes += chunk["data"]
+
+            if not audio_bytes:
+                raise Exception("Edge TTS returned empty audio")
+
+            duration = self._estimate_duration(text)
+
+            return {
+                "success": True,
+                "audio_data": audio_bytes,
+                "format": "mp3",
+                "voice": selected_voice,
+                "language": resolved_lang,
+                "duration": duration,
+                "size": len(audio_bytes),
+                "provider": "edge_tts",
+            }
+        except Exception as e:
+            logger.error(f"Edge TTS synthesis error: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "audio_data": b"",
+                "format": "mp3",
+                "provider": "edge_tts",
             }
 
     def _synthesize_with_gemini(self, text: str, voice_name: str) -> Dict[str, Any]:

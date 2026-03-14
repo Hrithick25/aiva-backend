@@ -11,7 +11,6 @@ from server.websocket_handler import router as ws_router
 from rag_faiss.retriever import _ensure_loaded as load_faiss_index
 from config.settings import WEBSOCKET_HOST, WEBSOCKET_PORT, AUDIO_SETTINGS
 from audio.manager import get_audio_manager
-from config.api_keys import get_api_key_manager
 
 # Configure logging
 logging.basicConfig(
@@ -47,17 +46,6 @@ async def startup():
     load_faiss_index()
     logger.info("[STARTUP] ✅ FAISS index loaded")
     
-    # Initialize API key manager
-    logger.info("[STARTUP] Initializing API key rotation...")
-    key_manager = get_api_key_manager()
-    key_status = key_manager.validate_keys()
-    
-    for service, is_valid in key_status.items():
-        if is_valid:
-            logger.info(f"[STARTUP] ✅ {service.upper()} keys loaded")
-        else:
-            logger.warning(f"[STARTUP] ⚠️  {service.upper()} keys missing")
-    
     # Initialize audio manager
     logger.info("[STARTUP] Initializing audio processing...")
     audio_manager = get_audio_manager()
@@ -76,10 +64,7 @@ async def health_check():
     """Health check endpoint"""
     audio_manager = get_audio_manager()
     capabilities = audio_manager.get_supported_formats()
-    
-    key_manager = get_api_key_manager()
-    key_status = key_manager.get_service_status()
-    
+
     return {
         "status": "healthy",
         "service": "Chopper AI Agent",
@@ -92,7 +77,6 @@ async def health_check():
             "api_key_rotation": True
         },
         "audio_capabilities": capabilities,
-        "api_key_status": key_status,
         "endpoints": {
             "websocket": "/ws",
             "health": "/",
@@ -106,7 +90,6 @@ async def health_check():
 async def get_audio_info():
     """Get detailed audio processing information"""
     audio_manager = get_audio_manager()
-    key_manager = get_api_key_manager()
     
     return {
         "capabilities": audio_manager.get_supported_formats(),
@@ -117,8 +100,7 @@ async def get_audio_info():
             "max_duration": AUDIO_SETTINGS["max_audio_duration"],
             "supported_languages": ["en", "ta"],
             "api_key_rotation": AUDIO_SETTINGS["enable_key_rotation"]
-        },
-        "api_key_status": key_manager.get_service_status()
+        }
     }
 
 
@@ -127,27 +109,6 @@ async def get_voices(language: str = "en"):
     """Get available voices for a language"""
     audio_manager = get_audio_manager()
     return await audio_manager.get_voice_options(language)
-
-
-@app.get("/admin/api-keys/status")
-async def get_api_key_status():
-    """Get API key rotation status (admin endpoint)"""
-    key_manager = get_api_key_manager()
-    return {
-        "key_status": key_manager.get_service_status(),
-        "validation": key_manager.validate_keys()
-    }
-
-
-@app.post("/admin/api-keys/reset")
-async def reset_api_key_rotation():
-    """Reset API key rotation to start position (admin endpoint)"""
-    key_manager = get_api_key_manager()
-    key_manager.reset_all_rotations()
-    return {
-        "status": "success",
-        "message": "API key rotations reset to start position"
-    }
 
 
 if __name__ == "__main__":
