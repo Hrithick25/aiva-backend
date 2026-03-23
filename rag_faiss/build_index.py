@@ -48,7 +48,7 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
 BATCH_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL}:batchEmbedContents"
 
 
-def _embed_texts(texts: List[str], batch_size: int = 100) -> np.ndarray:
+def _embed_texts(texts: List[str], batch_size: int = 90) -> np.ndarray:
     vecs: List[List[float]] = []
     
     for i in range(0, len(texts), batch_size):
@@ -66,7 +66,8 @@ def _embed_texts(texts: List[str], batch_size: int = 100) -> np.ndarray:
         payload = {"requests": requests_payload}
         
         retry_count = 0
-        while retry_count < 3:
+        max_retries = 5
+        while retry_count < max_retries:
             resp = requests.post(
                 BATCH_EMBED_URL,
                 params={"key": GEMINI_API_KEY},
@@ -75,9 +76,11 @@ def _embed_texts(texts: List[str], batch_size: int = 100) -> np.ndarray:
             )
             
             if resp.status_code == 429:
-                print(f"  [embed] Rate limited on batch {i//batch_size}. Retrying in 10s...")
-                time.sleep(10)
+                print(f"  [embed] Rate limited! (Free tier limit: 100 RPM). Sleeping for 60s...")
+                time.sleep(60)
                 retry_count += 1
+                if retry_count >= max_retries:
+                    raise RuntimeError(f"Failed to embed texts after {max_retries} retries due to persistent rate limiting.")
                 continue
                 
             resp.raise_for_status()
@@ -87,6 +90,9 @@ def _embed_texts(texts: List[str], batch_size: int = 100) -> np.ndarray:
                 vecs.append(embedding_obj["values"])
                 
             break
+            
+        if not vecs and len(texts) > 0:
+            raise RuntimeError("Successfully called API but returned no embeddings.")
             
         print(f"  [embed] {min(i + batch_size, len(texts))}/{len(texts)} texts batched and embedded.")
         time.sleep(2)  # Small delay between batches

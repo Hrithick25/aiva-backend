@@ -1,22 +1,15 @@
 fastapi
 uvicorn[standard]
 websockets
-chromadb
-langchain
-langchain-community
-pypdf
 python-dotenv
-sentence-transformers
-numpy
 faiss-cpu
-google-generativeai
+numpy
+requests
 
-# STT Provider
-groq
+# Audio Processing Dependencies
+groq                          # Groq API for STT and LLM
+google-genai                  # Google Gemini API for TTS and AI chat
+google-generativeai           # Legacy Gemini library used in RAG
 
-# TTS Provider (Microsoft Edge TTS - no API key required)
+# Edge TTS for enhanced voice synthesis
 edge-tts
-
-# Audio processing utilities
-soundfile
-librosa
