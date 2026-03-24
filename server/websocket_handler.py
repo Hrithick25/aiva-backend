@@ -12,36 +12,12 @@ from audio.manager import get_audio_manager
 router = APIRouter()
 audio_manager = get_audio_manager()
 
-_ws_sessions: dict = {}
 
-async def call_agent_with_history(ws: WebSocket, query: str, language_context: Optional[dict] = None) -> dict:
-    session_id = id(ws)
-    if session_id not in _ws_sessions:
-        _ws_sessions[session_id] = {"chat_history": [], "last_query": ""}
-    
-    session_data = _ws_sessions[session_id]
-    
-    rag_query = query
-    # Check if short query, assume it's a follow-up
-    if len(query.split()) <= 4 and session_data["last_query"]:
-        rag_query = f"{session_data['last_query']} {query}"
-    else:
-        current_len = len(query.split())
-        if current_len > 4:
-            session_data["last_query"] = query
-        
-    result = await get_agent_response(query, language_context, session_data["chat_history"], rag_query)
-    
-    # Update history
-    if result and "response" in result:
-        session_data["chat_history"].append({"role": "user", "content": query})
-        session_data["chat_history"].append({"role": "assistant", "content": result["response"]})
-        
-        # Keep only the last 6 messages (3 turns)
-        if len(session_data["chat_history"]) > 6:
-            session_data["chat_history"] = session_data["chat_history"][-6:]
-            
-    return result
+
+async def call_agent(ws: WebSocket, query: str, language_context: Optional[dict] = None) -> dict:
+    """Direct agent call — no chat history, no follow-up tracking."""
+    return await get_agent_response(query, language_context)
+
 
 # --------------- Response Cache ---------------
 # OPTIMIZED: LRU cache for repeated queries (e.g., "hostel timings", "CSE cutoff")
@@ -51,17 +27,16 @@ _CACHE_MAX_SIZE = 64
 
 
 def _get_cached_response(query: str) -> Optional[dict]:
-    """Check if a response is cached for this query (case-insensitive)."""
-    return _response_cache.get(query.strip().lower())
+    """Check if a response is cached for this query (case-insensitive, whitespace-normalized)."""
+    return _response_cache.get(" ".join(query.split()).lower())
 
 
 def _cache_response(query: str, result: dict):
     """Cache a response for future identical queries."""
     if len(_response_cache) >= _CACHE_MAX_SIZE:
-        # Evict oldest entry (FIFO)
         oldest_key = next(iter(_response_cache))
         del _response_cache[oldest_key]
-    _response_cache[query.strip().lower()] = result
+    _response_cache[" ".join(query.split()).lower()] = result
 
 # --------------- Daily Request Counter ---------------
 MAX_DAILY_REQUESTS = 100
@@ -115,9 +90,8 @@ def detect_language(text: str) -> str:
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    session_id = id(ws)
-    _ws_sessions[session_id] = {"chat_history": [], "last_query": ""}
     print("[WS] Client connected")
+
 
     # Send initial request status on connect
     reset_counter()
@@ -138,14 +112,10 @@ async def websocket_endpoint(ws: WebSocket):
                     await handle_binary_message(ws, message["bytes"])
             elif message["type"] == "websocket.disconnect":
                 print("[WS] Client disconnected")
-                if session_id in _ws_sessions:
-                    del _ws_sessions[session_id]
                 break
 
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
-        if session_id in _ws_sessions:
-            del _ws_sessions[session_id]
     except Exception as e:
         traceback.print_exc()
         try:
@@ -179,7 +149,7 @@ async def handle_text_message(ws: WebSocket, data: str):
             return
 
         print(f"[WS] Text Query: {query}")
-        result = await call_agent_with_history(ws, query)
+        result = await call_agent(ws, query)
         result["type"] = "text_response"
         print(f"[WS] Text Response: {result}")
         await ws.send_json(result)
@@ -256,7 +226,7 @@ async def handle_text_query(ws: WebSocket, payload: dict):
         print(f"[WS] ⚡ Cache HIT for: '{query[:50]}' (~0ms)")
     else:
         # Get agent response with language context and chat history
-        result = await call_agent_with_history(ws, query, language_context)
+        result = await call_agent(ws, query, language_context)
         # Cache the result for future identical queries if standalone
         if is_standalone:
             _cache_response(query, result)
@@ -304,7 +274,7 @@ async def handle_binary_message(ws: WebSocket, binary_data: bytes):
 
     conversation_result = await audio_manager.process_audio_conversation(
         binary_data,
-        lambda q, lc=None: call_agent_with_history(ws, q, lc),
+        lambda q, lc=None: call_agent(ws, q, lc),
         input_language="en",
         output_language="en"
     )
@@ -363,7 +333,7 @@ async def handle_audio_base64_query(ws: WebSocket, payload: dict):
 
         conversation_result = await audio_manager.process_audio_conversation(
             audio_data,
-            lambda q, lc=None: call_agent_with_history(ws, q, lc),
+            lambda q, lc=None: call_agent(ws, q, lc),
             input_language=input_language,
             output_language=output_language
         )
@@ -514,7 +484,7 @@ async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
             print(f"[WS] ⚡ Agent cache HIT (~0ms)")
         else:
             agent_start = time.time()
-            agent_result = await call_agent_with_history(ws, input_text, language_context)
+            agent_result = await call_agent(ws, input_text, language_context)
             agent_duration = (time.time() - agent_start) * 1000
             if is_standalone:
                 _cache_response(input_text, agent_result)

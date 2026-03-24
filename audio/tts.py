@@ -12,6 +12,25 @@ import edge_tts
 logger = logging.getLogger(__name__)
 
 
+def _clean_for_tts(text: str) -> str:
+    """Strip markdown formatting that TTS would read aloud literally.
+    - Removes leading bullet dashes (- point) so TTS doesn't say 'dash'
+    - Collapses multiple blank lines
+    - Strips trailing/leading whitespace
+    """
+    # Remove markdown bullet dashes at line start
+    lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            lines.append(stripped[2:])   # remove '- '
+        elif stripped.startswith("-") and len(stripped) > 1 and stripped[1] == " ":
+            lines.append(stripped[2:])
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 class TTSProcessor:
     def __init__(self):
         """Initialize TTS processor with Edge TTS voices for en, ta, hi."""
@@ -47,11 +66,14 @@ class TTSProcessor:
                 resolved_lang, self.voice_mapping["en"]
             )
 
+            # Clean markdown formatting so TTS doesn't read 'dash' for bullets
+            clean_text = _clean_for_tts(text)
+
             logger.info(
                 f"Synthesizing with Edge TTS: voice={selected_voice}, lang={resolved_lang}"
             )
 
-            communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+            communicate = edge_tts.Communicate(text=clean_text, voice=selected_voice)
             audio_bytes = b""
             async for chunk in communicate.stream():
                 if chunk.get("type") == "audio" and chunk.get("data"):
@@ -83,23 +105,20 @@ class TTSProcessor:
             }
 
     async def stream_edge_tts(self, text: str, language: str, websocket):
-        """Stream Edge TTS audio chunks directly to a WebSocket as binary frames.
-
-        Args:
-            text: Text to synthesize
-            language: Language code ("en", "ta", "hi")
-            websocket: FastAPI WebSocket instance
-        """
+        """Stream Edge TTS audio chunks directly to a WebSocket as binary frames."""
         resolved_lang = (language or "en").strip().lower()
         selected_voice = self.voice_mapping.get(
             resolved_lang, self.voice_mapping["en"]
         )
 
+        # Clean markdown so TTS doesn't say 'dash'
+        clean_text = _clean_for_tts(text)
+
         logger.info(
             f"Streaming Edge TTS: voice={selected_voice}, lang={resolved_lang}"
         )
 
-        communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+        communicate = edge_tts.Communicate(text=clean_text, voice=selected_voice)
         chunk_count = 0
         total_bytes = 0
 

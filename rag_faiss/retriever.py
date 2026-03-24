@@ -44,7 +44,6 @@ def _get_http_session() -> requests.Session:
     global _http_session
     if _http_session is None:
         _http_session = requests.Session()
-        # Keep-alive is enabled by default in Session
         _http_session.headers.update({"Connection": "keep-alive"})
     return _http_session
 
@@ -123,7 +122,8 @@ def retrieve(query: str, top_k: int = TOP_K) -> dict:
     distances, ids = _faiss_index.search(query_vec, top_k)
 
     chunks: List[str] = []
-    sources_seen: List[str] = []
+    sources_seen: set = set()
+    sources_ordered: List[str] = []
 
     for faiss_id in ids[0]:
         if faiss_id == -1:
@@ -135,11 +135,12 @@ def retrieve(query: str, top_k: int = TOP_K) -> dict:
 
         source_txt = pickle_filename.replace(".pkl", ".txt")
         if source_txt not in sources_seen:
-            sources_seen.append(source_txt)
+            sources_seen.add(source_txt)
+            sources_ordered.append(source_txt)
 
     return {
-        "context": "\n\n".join(chunks),
-        "sources": sources_seen,
+        "context": "\n".join(chunks),   # single \n saves tokens vs double
+        "sources": sources_ordered,
     }
 
 

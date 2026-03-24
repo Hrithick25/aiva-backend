@@ -27,7 +27,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -118,6 +118,6 @@ if __name__ == "__main__":
         "main:app", 
         host=WEBSOCKET_HOST, 
         port=WEBSOCKET_PORT, 
-        reload=True,
+        reload=False,      # file-watcher adds overhead; restart manually when needed
         log_level="info"
     )
