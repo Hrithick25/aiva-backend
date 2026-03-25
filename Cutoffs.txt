@@ -25,7 +25,6 @@ The minimum cutoff marks for the Computer Science and Business Systems departmen
 • MBC: 182.5
 • SC: 162.79
 • SCA: 141.5
-• ST: Not Available
 Computer and Communication Engineering (CCE)
 The minimum cutoff marks for the Computer and Communication Engineering department are:
 • OC: 189
@@ -34,7 +33,6 @@ The minimum cutoff marks for the Computer and Communication Engineering departme
 • MBC: 184
 • SC: 153
 • SCA: 156
-• ST: Not Available
 Computer Science and Engineering (CSE)
 The minimum cutoff marks for the Computer Science and Engineering department are:
 • OC: 193.5
@@ -61,7 +59,6 @@ The minimum cutoff marks for the Electrical and Electronics Engineering departme
 • MBC: 180.5
 • SC: 152.5
 • SCA: 145.5
-• ST: Not Available
 Information Technology (IT)
 The minimum cutoff marks for the Information Technology department are:
 • OC: 192.5
@@ -70,7 +67,6 @@ The minimum cutoff marks for the Information Technology department are:
 • MBC: 187
 • SC: 173.5
 • SCA: 159.5
-• ST: Not Available
 Mechanical Engineering (MECH)
 The minimum cutoff marks for the Mechanical Engineering department are:
 • OC: 184
@@ -88,4 +84,3 @@ The minimum cutoff marks for the Cyber Security department are:
 • MBC: 185
 • SC: 159
 • SCA: 150.5
-• ST: Not Available

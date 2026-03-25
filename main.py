@@ -20,15 +20,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Chopper AI Agent", 
-    description="AI Agent with Speech-to-Text and Text-to-Speech capabilities",
-    version="1.0.0"
+    title="AIVA - AI Virtual Assistant",
+    description="AI Virtual Assistant for Sri Eshwar College of Engineering",
+    version="3.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
+    allow_origins=["*"],   # allow all origins (Vercel frontend + localhost)
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

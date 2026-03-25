@@ -41,49 +41,65 @@ class TTSProcessor:
         Returns:
             Dict with audio data and metadata
         """
-        try:
-            resolved_lang = (language or "en").strip().lower()
-            selected_voice = voice or self.voice_mapping.get(
-                resolved_lang, self.voice_mapping["en"]
-            )
+        resolved_lang = (language or "en").strip().lower()
+        selected_voice = voice or self.voice_mapping.get(
+            resolved_lang, self.voice_mapping["en"]
+        )
 
-            logger.info(
-                f"Synthesizing with Edge TTS: voice={selected_voice}, lang={resolved_lang}"
-            )
+        last_error = None
+        for attempt in range(3):  # up to 3 attempts
+            try:
+                logger.info(
+                    f"Synthesizing with Edge TTS (attempt {attempt+1}): voice={selected_voice}, lang={resolved_lang}"
+                )
 
-            communicate = edge_tts.Communicate(text=text, voice=selected_voice)
-            audio_bytes = b""
-            async for chunk in communicate.stream():
-                if chunk.get("type") == "audio" and chunk.get("data"):
-                    audio_bytes += chunk["data"]
+                communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+                audio_bytes = b""
 
-            if not audio_bytes:
-                raise Exception("Edge TTS returned empty audio")
+                async def _collect():
+                    nonlocal audio_bytes
+                    async for chunk in communicate.stream():
+                        if chunk.get("type") == "audio" and chunk.get("data"):
+                            audio_bytes += chunk["data"]
 
-            duration = self._estimate_duration(text)
+                await asyncio.wait_for(_collect(), timeout=30)
 
-            return {
-                "success": True,
-                "audio_data": audio_bytes,
-                "format": "mp3",
-                "voice": selected_voice,
-                "language": resolved_lang,
-                "duration": duration,
-                "size": len(audio_bytes),
-                "provider": "edge_tts",
-            }
-        except Exception as e:
-            logger.error(f"Edge TTS synthesis error: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e),
-                "audio_data": b"",
-                "format": "mp3",
-                "provider": "edge_tts",
-            }
+                if not audio_bytes:
+                    raise Exception("Edge TTS returned empty audio")
+
+                duration = self._estimate_duration(text)
+
+                return {
+                    "success": True,
+                    "audio_data": audio_bytes,
+                    "format": "mp3",
+                    "voice": selected_voice,
+                    "language": resolved_lang,
+                    "duration": duration,
+                    "size": len(audio_bytes),
+                    "provider": "edge_tts",
+                }
+            except asyncio.TimeoutError:
+                last_error = "Edge TTS timed out after 30s"
+                logger.warning(f"Edge TTS attempt {attempt+1} timed out, retrying...")
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Edge TTS attempt {attempt+1} failed: {last_error}, retrying...")
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+        logger.error(f"Edge TTS synthesis failed after 3 attempts: {last_error}")
+        return {
+            "success": False,
+            "error": last_error,
+            "audio_data": b"",
+            "format": "mp3",
+            "provider": "edge_tts",
+        }
 
     async def stream_edge_tts(self, text: str, language: str, websocket):
         """Stream Edge TTS audio chunks directly to a WebSocket as binary frames.
+        Retries up to 3 times on network errors / timeouts.
 
         Args:
             text: Text to synthesize
@@ -95,23 +111,46 @@ class TTSProcessor:
             resolved_lang, self.voice_mapping["en"]
         )
 
-        logger.info(
-            f"Streaming Edge TTS: voice={selected_voice}, lang={resolved_lang}"
-        )
+        last_error = None
+        for attempt in range(3):  # up to 3 retry attempts
+            try:
+                logger.info(
+                    f"Streaming Edge TTS (attempt {attempt+1}): voice={selected_voice}, lang={resolved_lang}"
+                )
 
-        communicate = edge_tts.Communicate(text=text, voice=selected_voice)
-        chunk_count = 0
-        total_bytes = 0
+                communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+                chunk_count = 0
+                total_bytes = 0
 
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio" and chunk.get("data"):
-                await websocket.send_bytes(chunk["data"])
-                chunk_count += 1
-                total_bytes += len(chunk["data"])
+                async def _stream():
+                    nonlocal chunk_count, total_bytes
+                    async for chunk in communicate.stream():
+                        if chunk.get("type") == "audio" and chunk.get("data"):
+                            await websocket.send_bytes(chunk["data"])
+                            chunk_count += 1
+                            total_bytes += len(chunk["data"])
 
-        logger.info(
-            f"Edge TTS stream complete: {chunk_count} chunks, {total_bytes} bytes"
-        )
+                await asyncio.wait_for(_stream(), timeout=45)
+
+                if total_bytes == 0:
+                    raise Exception("Edge TTS stream returned 0 bytes")
+
+                logger.info(
+                    f"Edge TTS stream complete: {chunk_count} chunks, {total_bytes} bytes"
+                )
+                return  # success — exit retry loop
+
+            except asyncio.TimeoutError:
+                last_error = "Edge TTS stream timed out after 45s"
+                logger.warning(f"Edge TTS stream attempt {attempt+1} timed out, retrying...")
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Edge TTS stream attempt {attempt+1} failed: {last_error}, retrying...")
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+        logger.error(f"Edge TTS stream failed after 3 attempts: {last_error}")
+        raise Exception(f"Edge TTS stream failed: {last_error}")
 
     def _estimate_duration(self, text: str) -> float:
         """Estimate audio duration based on text length."""

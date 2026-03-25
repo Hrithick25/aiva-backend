@@ -6,6 +6,26 @@ CSE Department (Computer Science and Engineering):
 - Companies Visiting: Philips, CommScope, Microsoft, JustPay, ServiceNow, BP
 - Top recruiters include both product and service-based MNCs.
 
+AIML Department (Artificial Intelligence and Machine Learning):
+- Highest Package: 45 LPA
+- Companies Visiting: Philips, CommScope, Microsoft, JustPay, ServiceNow, BP
+- Shares placement companies with CSE; strong in AI/ML product companies.
+
+CSBS Department (Computer Science and Business Systems):
+- Highest Package: 45 LPA
+- Companies Visiting: Philips, CommScope, Microsoft, JustPay, ServiceNow, BP
+- Combines CS and business skills, attracting top tech and analytics firms.
+
+CCE Department (Computer and Communication Engineering):
+- Highest Package: 45 LPA
+- Companies Visiting: Philips, CommScope, Microsoft, JustPay, ServiceNow, BP
+- Focuses on communication systems and software, placed in major MNCs.
+
+Cyber Security Department:
+- Highest Package: 45 LPA
+- Companies Visiting: Philips, CommScope, Microsoft, JustPay, ServiceNow, BP
+- Emerging niche with strong demand in security-focused tech companies.
+
 IT Department (Information Technology):
 - Highest Package: 60 LPA
 - Companies Visiting: Microsoft, JustPay, Amazon, Dell, ServiceNow
@@ -34,10 +54,10 @@ MECH Department (Mechanical Engineering):
 Overall Placement Statistics 2026:
 - Total students placed: 790+
 - Placement rate: 95%
-- Highest package: Rs.60 LPA (IT Department)
-- Students at Rs.40+ LPA: 7 students
-- Students at Rs.20+ LPA: 20 students
-- Students at Rs.10+ LPA: 100 students
-- Students at Rs.8+ LPA: 150+
+- Highest package: 60 LPA (IT Department)
+- Students at 40+ LPA: 7 students
+- Students at 20+ LPA: 20 students
+- Students at 10+ LPA: 100 students
+- Students at 8+ LPA: 150+
 - Total companies: 200+
 - MNCs: 120+

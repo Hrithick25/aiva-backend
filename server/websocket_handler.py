@@ -3,7 +3,6 @@ import traceback
 import base64
 import time
 import asyncio
-from datetime import date
 from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from agent.groq_llama_agent import get_agent_response
@@ -63,43 +62,6 @@ def _cache_response(query: str, result: dict):
         del _response_cache[oldest_key]
     _response_cache[query.strip().lower()] = result
 
-# --------------- Daily Request Counter ---------------
-MAX_DAILY_REQUESTS = 100
-request_count = 0
-current_day = date.today()
-
-
-def reset_counter():
-    """Reset the daily request counter if the day has changed."""
-    global current_day, request_count
-    if date.today() != current_day:
-        request_count = 0
-        current_day = date.today()
-
-
-async def check_and_increment(ws: WebSocket) -> bool:
-    """Check limit, increment counter, and send status.
-
-    Returns True if the request is allowed, False if limit reached.
-    """
-    global request_count
-    reset_counter()
-
-    if request_count >= MAX_DAILY_REQUESTS:
-        await ws.send_json({
-            "type": "limit_reached",
-            "message": "Daily request limit reached. Please try again tomorrow."
-        })
-        return False
-
-    request_count += 1
-    await ws.send_json({
-        "type": "request_status",
-        "remaining": MAX_DAILY_REQUESTS - request_count,
-        "total": MAX_DAILY_REQUESTS
-    })
-    return True
-
 
 def detect_language(text: str) -> str:
     """Detect language from text by checking for Tamil / Hindi Unicode characters.
@@ -118,14 +80,6 @@ async def websocket_endpoint(ws: WebSocket):
     session_id = id(ws)
     _ws_sessions[session_id] = {"chat_history": [], "last_query": ""}
     print("[WS] Client connected")
-
-    # Send initial request status on connect
-    reset_counter()
-    await ws.send_json({
-        "type": "request_status",
-        "remaining": MAX_DAILY_REQUESTS - request_count,
-        "total": MAX_DAILY_REQUESTS
-    })
 
     try:
         while True:
@@ -172,10 +126,6 @@ async def handle_text_message(ws: WebSocket, data: str):
                 "response": "Please send a valid query.",
                 "emotion": "none"
             })
-            return
-
-        # Check daily limit
-        if not await check_and_increment(ws):
             return
 
         print(f"[WS] Text Query: {query}")
@@ -226,10 +176,6 @@ async def handle_text_query(ws: WebSocket, payload: dict):
         })
         return
 
-    # Check daily limit
-    if not await check_and_increment(ws):
-        return
-
     total_start = time.time()
     print(f"[WS] JSON Text Query: {query}")
 
@@ -245,22 +191,16 @@ async def handle_text_query(ws: WebSocket, payload: dict):
         "confidence": 1.0
     }
 
-    # OPTIMIZED: Check response cache first
-    cached = None
-    is_standalone = len(query.split()) > 4
-    if is_standalone:
-        cached = _get_cached_response(query)
-        
+    # OPTIMIZED: Check response cache first (all queries, not just long ones)
+    cached = _get_cached_response(query)
     if cached:
         result = cached.copy()
         print(f"[WS] ⚡ Cache HIT for: '{query[:50]}' (~0ms)")
     else:
         # Get agent response with language context and chat history
         result = await call_agent_with_history(ws, query, language_context)
-        # Cache the result for future identical queries if standalone
-        if is_standalone:
-            _cache_response(query, result)
-            print(f"[WS] 💾 Cached response for: '{query[:50]}'")
+        _cache_response(query, result)
+        print(f"[WS] 💾 Cached response for: '{query[:50]}'")
 
     if enable_tts and result.get("response"):
         # Auto-detect language from the actual response text
@@ -296,10 +236,6 @@ async def handle_text_query(ws: WebSocket, payload: dict):
 
 async def handle_binary_message(ws: WebSocket, binary_data: bytes):
     """Handle raw binary audio data"""
-    # Check daily limit
-    if not await check_and_increment(ws):
-        return
-
     print(f"[WS] Received binary audio: {len(binary_data)} bytes")
 
     conversation_result = await audio_manager.process_audio_conversation(
@@ -348,10 +284,6 @@ async def handle_audio_base64_query(ws: WebSocket, payload: dict):
                 "response": "No audio data provided",
                 "emotion": "sad"
             })
-            return
-
-        # Check daily limit
-        if not await check_and_increment(ws):
             return
 
         audio_data = base64.b64decode(audio_base64)
@@ -454,10 +386,6 @@ async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
             })
             return
 
-        # Check daily limit
-        if not await check_and_increment(ws):
-            return
-
         pipeline_start = time.time()
         audio_data = base64.b64decode(audio_base64)
 
@@ -502,12 +430,8 @@ async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
             "message": "Processing your query..."
         })
 
-        # Step 3: Agent Processing (with cache)
-        cached = None
-        is_standalone = len(input_text.split()) > 4
-        if is_standalone:
-            cached = _get_cached_response(input_text)
-            
+        # Agent Processing (with cache — all queries cached)
+        cached = _get_cached_response(input_text)
         if cached:
             agent_result = cached.copy()
             agent_duration = 0.0
@@ -516,11 +440,8 @@ async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
             agent_start = time.time()
             agent_result = await call_agent_with_history(ws, input_text, language_context)
             agent_duration = (time.time() - agent_start) * 1000
-            if is_standalone:
-                _cache_response(input_text, agent_result)
-                print(f"[WS] ⏱️ Agent took {agent_duration:.1f}ms (cached for next time)")
-            else:
-                print(f"[WS] ⏱️ Agent took {agent_duration:.1f}ms")
+            _cache_response(input_text, agent_result)
+            print(f"[WS] ⏱️ Agent took {agent_duration:.1f}ms (cached)")
 
         if not isinstance(agent_result, dict):
             await ws.send_json({

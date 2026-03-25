@@ -8,6 +8,15 @@ load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Support multiple API keys for automatic rotation when one is rate-limited
+_all_keys = [
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+]
+GEMINI_API_KEYS = [k for k in _all_keys if k]  # filter out None/empty
+
+
 # ── Source documents ─────────────────────────────────────────────────
 DATA_DIR = os.path.join(BASE_DIR, "rag_faiss", "data")
 
@@ -44,7 +53,7 @@ HNSW_EF_SEARCH = 64
 
 # ── Retrieval defaults ───────────────────────────────────────────────
 # OPTIMIZED: Fewer results = less noise in LLM context, faster generation
-TOP_K = 3
+TOP_K = 5
 
 # ── Gemini embedding model ───────────────────────────────────────────
 EMBEDDING_MODEL = "models/gemini-embedding-001"
