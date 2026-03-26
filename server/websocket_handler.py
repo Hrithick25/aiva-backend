@@ -1,4 +1,17 @@
+"""
+websocket_handler.py — AIVA WebSocket gateway.
+
+Crash-proofing guarantees:
+  • _safe_send_json() swallows disconnects on every outgoing JSON message.
+  • handle_audio_base64_streaming() has a 30-second hard asyncio timeout.
+  • TTS errors fall back to single-shot synthesis; if that also fails, the
+    text response (already sent) is sufficient and we simply stop.
+  • All entry points have a top-level try/except so no unhandled exception
+    ever propagates to the main WebSocket loop.
+"""
+
 import json
+import re
 import traceback
 import base64
 import time
@@ -13,59 +26,70 @@ audio_manager = get_audio_manager()
 
 _ws_sessions: dict = {}
 
-async def call_agent_with_history(ws: WebSocket, query: str, language_context: Optional[dict] = None) -> dict:
+
+# ── Safe send helpers ─────────────────────────────────────────────────────────
+
+async def _safe_send_json(ws: WebSocket, data: dict) -> bool:
+    """Sends JSON without raising if the client has already disconnected."""
+    try:
+        await ws.send_json(data)
+        return True
+    except Exception:
+        return False
+
+
+# ── Session / agent helpers ───────────────────────────────────────────────────
+
+async def call_agent_with_history(
+    ws: WebSocket,
+    query: str,
+    language_context: Optional[dict] = None,
+) -> dict:
     session_id = id(ws)
     if session_id not in _ws_sessions:
         _ws_sessions[session_id] = {"chat_history": [], "last_query": ""}
-    
+
     session_data = _ws_sessions[session_id]
-    
+
     rag_query = query
-    # Check if short query, assume it's a follow-up
     if len(query.split()) <= 4 and session_data["last_query"]:
         rag_query = f"{session_data['last_query']} {query}"
-    else:
-        current_len = len(query.split())
-        if current_len > 4:
-            session_data["last_query"] = query
-        
-    result = await get_agent_response(query, language_context, session_data["chat_history"], rag_query)
-    
-    # Update history
+    elif len(query.split()) > 4:
+        session_data["last_query"] = query
+
+    result = await get_agent_response(
+        query, language_context, session_data["chat_history"], rag_query
+    )
+
     if result and "response" in result:
-        session_data["chat_history"].append({"role": "user", "content": query})
+        session_data["chat_history"].append({"role": "user",      "content": query})
         session_data["chat_history"].append({"role": "assistant", "content": result["response"]})
-        
-        # Keep only the last 6 messages (3 turns)
         if len(session_data["chat_history"]) > 6:
             session_data["chat_history"] = session_data["chat_history"][-6:]
-            
+
     return result
 
-# --------------- Response Cache ---------------
-# OPTIMIZED: LRU cache for repeated queries (e.g., "hostel timings", "CSE cutoff")
-# Cache hit = ~0ms agent time. Max 64 unique queries cached.
+
+# ── Response cache ────────────────────────────────────────────────────────────
+
 _response_cache: dict = {}
-_CACHE_MAX_SIZE = 64
+_CACHE_MAX_SIZE = 256
 
 
 def _get_cached_response(query: str) -> Optional[dict]:
-    """Check if a response is cached for this query (case-insensitive)."""
     return _response_cache.get(query.strip().lower())
 
 
 def _cache_response(query: str, result: dict):
-    """Cache a response for future identical queries."""
     if len(_response_cache) >= _CACHE_MAX_SIZE:
-        # Evict oldest entry (FIFO)
-        oldest_key = next(iter(_response_cache))
-        del _response_cache[oldest_key]
+        del _response_cache[next(iter(_response_cache))]
     _response_cache[query.strip().lower()] = result
 
 
+# ── Language helpers ──────────────────────────────────────────────────────────
+
 def detect_language(text: str) -> str:
-    """Detect language from text by checking for Tamil / Hindi Unicode characters.
-    Returns 'ta' if Tamil script found, 'hi' if Devanagari found, else 'en'."""
+    """Unicode-only detection (works for Tamil script and Hindi; not Tanglish)."""
     for char in text:
         if '\u0B80' <= char <= '\u0BFF':
             return "ta"
@@ -73,6 +97,21 @@ def detect_language(text: str) -> str:
             return "hi"
     return "en"
 
+
+def _normalise_lang(raw: Optional[str]) -> str:
+    """Map any language hint to en/ta/hi; unknown → 'auto'."""
+    if not raw:
+        return "auto"
+    raw = raw.strip().lower()
+    mapping = {
+        "en": "en", "en-us": "en", "en-in": "en", "english": "en",
+        "ta": "ta", "ta-in": "ta", "tamil": "ta",
+        "hi": "hi", "hi-in": "hi", "hindi": "hi",
+    }
+    return mapping.get(raw, "auto")
+
+
+# ── WebSocket entry point ─────────────────────────────────────────────────────
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -84,640 +123,506 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             message = await ws.receive()
-
             if message["type"] == "websocket.receive":
                 if "text" in message:
                     await handle_text_message(ws, message["text"])
                 elif "bytes" in message:
                     await handle_binary_message(ws, message["bytes"])
             elif message["type"] == "websocket.disconnect":
-                print("[WS] Client disconnected")
-                if session_id in _ws_sessions:
-                    del _ws_sessions[session_id]
+                print("[WS] Client disconnected (clean)")
                 break
 
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
-        if session_id in _ws_sessions:
-            del _ws_sessions[session_id]
     except Exception as e:
         traceback.print_exc()
-        try:
-            await ws.send_json({
-                "type": "error",
-                "response": f"Server error: {str(e)}",
-                "emotion": "sad"
-            })
-        except Exception:
-            pass
+        await _safe_send_json(ws, {
+            "type": "error",
+            "response": f"Server error: {str(e)}",
+            "emotion": "sad",
+        })
+    finally:
+        _ws_sessions.pop(session_id, None)
 
+
+# ── Message routers ───────────────────────────────────────────────────────────
 
 async def handle_text_message(ws: WebSocket, data: str):
-    """Handle plain text messages (legacy support)"""
     try:
         payload = json.loads(data)
         await handle_json_message(ws, payload)
     except json.JSONDecodeError:
-        # Plain text query
         query = data.strip()
         if not query:
-            await ws.send_json({
-                "type": "text_response",
-                "response": "Please send a valid query.",
-                "emotion": "none"
-            })
+            await _safe_send_json(ws, {"type": "text_response", "response": "Please send a valid query.", "emotion": "none"})
             return
-
-        print(f"[WS] Text Query: {query}")
         result = await call_agent_with_history(ws, query)
         result["type"] = "text_response"
-        print(f"[WS] Text Response: {result}")
-        await ws.send_json(result)
+        await _safe_send_json(ws, result)
+    except Exception as e:
+        await _safe_send_json(ws, {"type": "error", "response": str(e), "emotion": "sad"})
 
 
 async def handle_json_message(ws: WebSocket, payload: dict):
-    """Handle structured JSON messages"""
     message_type = payload.get("type", "text")
-
-    if message_type == "text":
-        await handle_text_query(ws, payload)
-    elif message_type == "audio":
-        await handle_audio_query(ws, payload)
-    elif message_type == "audio_base64":
-        await handle_audio_base64_query(ws, payload)
-    elif message_type == "get_audio_info":
-        await handle_audio_info_request(ws)
-    elif message_type == "get_voices":
-        await handle_voices_request(ws, payload)
-    elif message_type == "audio_base64_streaming":
-        await handle_audio_base64_streaming(ws, payload)
-    elif message_type == "audio_streaming":
-        await handle_audio_streaming(ws, payload)
-    elif message_type == "audio_tts_streaming":
-        await handle_tts_streaming(ws, payload)
-    elif message_type == "test_immediate":
-        await handle_test_immediate(ws, payload)
+    handlers = {
+        "text":                 handle_text_query,
+        "audio":                handle_audio_query,
+        "audio_base64":         handle_audio_base64_query,
+        "get_audio_info":       lambda w, p: handle_audio_info_request(w),
+        "get_voices":           handle_voices_request,
+        "audio_base64_streaming": handle_audio_base64_streaming,
+        "audio_streaming":      handle_audio_streaming,
+        "audio_tts_streaming":  handle_tts_streaming,
+        "test_immediate":       handle_test_immediate,
+    }
+    handler = handlers.get(message_type)
+    if handler:
+        await handler(ws, payload)
     else:
-        await ws.send_json({
-            "type": "error",
-            "response": f"Unknown message type: {message_type}",
-            "emotion": "sad"
-        })
+        await _safe_send_json(ws, {"type": "error", "response": f"Unknown type: {message_type}", "emotion": "sad"})
 
+
+# ── Text query ────────────────────────────────────────────────────────────────
 
 async def handle_text_query(ws: WebSocket, payload: dict):
-    """Handle text-based queries with response caching"""
     query = payload.get("query", "").strip()
     if not query:
-        await ws.send_json({
-            "type": "text_response",
-            "response": "Please send a valid query.",
-            "emotion": "none"
-        })
+        await _safe_send_json(ws, {"type": "text_response", "response": "Please send a valid query.", "emotion": "none"})
         return
 
-    total_start = time.time()
-    print(f"[WS] JSON Text Query: {query}")
-
-    # Check if TTS is requested
+    t0         = time.time()
     enable_tts = payload.get("enable_tts", False)
+    raw_lang   = payload.get("language")
+    query_lang = _normalise_lang(raw_lang)
+    if query_lang == "auto":
+        query_lang = detect_language(query)
 
-    # Use language from payload if provided, else detect from text
-    user_language = payload.get("language", None)
-    query_lang = user_language if user_language in ("en", "ta", "hi") else detect_language(query)
-    language_context = {
-        "language": query_lang,
-        "is_tamil": query_lang == "ta",
-        "confidence": 1.0
-    }
+    lang_ctx = {"language": query_lang, "is_tamil": query_lang == "ta", "confidence": 1.0}
 
-    # OPTIMIZED: Check response cache first (all queries, not just long ones)
     cached = _get_cached_response(query)
     if cached:
         result = cached.copy()
-        print(f"[WS] ⚡ Cache HIT for: '{query[:50]}' (~0ms)")
     else:
-        # Get agent response with language context and chat history
-        result = await call_agent_with_history(ws, query, language_context)
+        result = await call_agent_with_history(ws, query, lang_ctx)
         _cache_response(query, result)
-        print(f"[WS] 💾 Cached response for: '{query[:50]}'")
+
+    # Use is_tamil from context — Tanglish is all-Latin
+    is_tamil_resp = query_lang == "ta"
 
     if enable_tts and result.get("response"):
-        # Auto-detect language from the actual response text
-        tts_language = detect_language(result["response"])
-        print(f"[WS] TTS language auto-detected: {tts_language}")
-
-        # Generate audio for the response
-        tts_result = await audio_manager.process_text_to_audio(
-            result["response"],
-            tts_language,
-            result.get("emotion", "none")
-        )
-
-        if tts_result["success"]:
-            audio_base64 = base64.b64encode(tts_result["audio_data"]).decode('utf-8')
-            result.update({
-                "type": "text_with_audio_response",
-                "audio_data": audio_base64,
-                "audio_format": tts_result["format"],
-                "audio_duration": tts_result["duration"]
-            })
-        else:
+        tts_lang = "ta" if is_tamil_resp else detect_language(result["response"])
+        try:
+            tts_result = await asyncio.wait_for(
+                audio_manager.process_text_to_audio(result["response"], tts_lang, result.get("emotion", "none")),
+                timeout=15.0,
+            )
+            if tts_result["success"]:
+                result.update({
+                    "type":           "text_with_audio_response",
+                    "audio_data":     base64.b64encode(tts_result["audio_data"]).decode("utf-8"),
+                    "audio_format":   tts_result["format"],
+                    "audio_duration": tts_result.get("duration", 0.0),
+                })
+            else:
+                result["type"] = "text_response"
+        except asyncio.TimeoutError:
             result["type"] = "text_response"
-            result["tts_error"] = tts_result.get("error", "TTS failed")
     else:
         result["type"] = "text_response"
 
-    total_ms = (time.time() - total_start) * 1000
-    print(f"[WS] ⏱️ Total text query pipeline: {total_ms:.0f}ms")
-    print(f"[WS] JSON Text Response: {result.get('response', '')[:100]}...")
-    await ws.send_json(result)
+    print(f"[WS] Text pipeline {(time.time()-t0)*1000:.0f}ms")
+    await _safe_send_json(ws, result)
 
+
+# ── Binary audio ──────────────────────────────────────────────────────────────
 
 async def handle_binary_message(ws: WebSocket, binary_data: bytes):
-    """Handle raw binary audio data"""
-    print(f"[WS] Received binary audio: {len(binary_data)} bytes")
-
-    conversation_result = await audio_manager.process_audio_conversation(
-        binary_data,
-        lambda q, lc=None: call_agent_with_history(ws, q, lc),
-        input_language="en",
-        output_language="en"
-    )
-
-    if conversation_result["success"]:
-        audio_base64 = base64.b64encode(conversation_result["audio_data"]).decode('utf-8')
-
-        response = {
-            "type": "audio_conversation_response",
-            "success": True,
-            "input_text": conversation_result["input_text"],
-            "response_text": conversation_result["response_text"],
-            "emotion": conversation_result["response_emotion"],
-            "audio_data": audio_base64,
-            "audio_format": conversation_result["audio_format"],
-            "audio_duration": conversation_result["audio_duration"],
-            "stt_confidence": conversation_result["stt_confidence"]
-        }
-    else:
-        response = {
-            "type": "audio_conversation_response",
-            "success": False,
-            "error": conversation_result["error"],
-            "input_text": conversation_result.get("input_text", ""),
-            "response_text": "",
-            "audio_data": "",
-            "stt_confidence": conversation_result.get("stt_confidence", 0.0)
-        }
-
-    print(f"[WS] Audio Conversation Response: {response.get('success', False)}")
-    await ws.send_json(response)
-
-
-async def handle_audio_base64_query(ws: WebSocket, payload: dict):
-    """Handle base64 encoded audio data"""
+    print(f"[WS] Binary audio {len(binary_data)}B")
     try:
-        audio_base64 = payload.get("audio_data", "")
-        if not audio_base64:
-            await ws.send_json({
-                "type": "error",
-                "response": "No audio data provided",
-                "emotion": "sad"
-            })
-            return
-
-        audio_data = base64.b64decode(audio_base64)
-
-        input_language = payload.get("input_language", "en")
-        output_language = payload.get("output_language", "en")
-
-        print(f"[WS] Received base64 audio: {len(audio_data)} bytes")
-
-        conversation_result = await audio_manager.process_audio_conversation(
-            audio_data,
+        result = await audio_manager.process_audio_conversation(
+            binary_data,
             lambda q, lc=None: call_agent_with_history(ws, q, lc),
-            input_language=input_language,
-            output_language=output_language
+            input_language="en",
+            output_language="en",
         )
-
-        if conversation_result["success"]:
-            response_audio_base64 = base64.b64encode(conversation_result["audio_data"]).decode('utf-8')
-
-            response = {
-                "type": "audio_conversation_response",
-                "success": True,
-                "input_text": conversation_result["input_text"],
-                "input_language": conversation_result["input_language"],
-                "response_text": conversation_result["response_text"],
-                "emotion": conversation_result["response_emotion"],
-                "audio_data": response_audio_base64,
-                "audio_format": conversation_result["audio_format"],
-                "audio_duration": conversation_result["audio_duration"],
-                "stt_confidence": conversation_result["stt_confidence"]
+        if result["success"]:
+            payload = {
+                "type":           "audio_conversation_response",
+                "success":        True,
+                "input_text":     result["input_text"],
+                "response_text":  result["response_text"],
+                "emotion":        result["response_emotion"],
+                "audio_data":     base64.b64encode(result["audio_data"]).decode("utf-8"),
+                "audio_format":   result["audio_format"],
+                "audio_duration": result["audio_duration"],
+                "stt_confidence": result["stt_confidence"],
             }
         else:
-            response = {
-                "type": "audio_conversation_response",
-                "success": False,
-                "error": conversation_result["error"],
-                "input_text": conversation_result.get("input_text", ""),
-                "response_text": "",
-                "audio_data": "",
-                "stt_confidence": conversation_result.get("stt_confidence", 0.0)
+            payload = {
+                "type":           "audio_conversation_response",
+                "success":        False,
+                "error":          result.get("error", "Unknown error"),
+                "input_text":     result.get("input_text", ""),
+                "response_text":  "",
+                "audio_data":     "",
+                "stt_confidence": result.get("stt_confidence", 0.0),
             }
-
-        print(f"[WS] Base64 Audio Response: {response.get('success', False)}")
-        await ws.send_json(response)
-
+        await _safe_send_json(ws, payload)
     except Exception as e:
-        await ws.send_json({
-            "type": "error",
-            "response": f"Audio processing error: {str(e)}",
-            "emotion": "sad"
-        })
+        await _safe_send_json(ws, {"type": "error", "response": str(e), "emotion": "sad"})
 
 
-async def handle_audio_streaming(ws: WebSocket, payload: dict):
-    """Handle raw audio data with streaming response"""
+# ── Base64 audio (non-streaming) ──────────────────────────────────────────────
+
+async def handle_audio_base64_query(ws: WebSocket, payload: dict):
     try:
-        audio_data = payload.get("audio_data", b"")
-        if not audio_data:
-            await ws.send_json({
-                "type": "error",
-                "response": "No audio data provided",
-                "emotion": "sad"
-            })
+        raw = payload.get("audio_data", "")
+        if not raw:
+            await _safe_send_json(ws, {"type": "error", "response": "No audio data provided", "emotion": "sad"})
             return
 
-        input_language = payload.get("input_language", "auto")
-        output_language = payload.get("output_language", "en")
+        audio_data = base64.b64decode(raw)
+        in_lang    = payload.get("input_language",  "en")
+        out_lang   = payload.get("output_language", "en")
 
-        await handle_audio_base64_streaming(ws, {
-            "audio_data": base64.b64encode(audio_data).decode('utf-8'),
-            "input_language": input_language,
-            "output_language": output_language,
-            "language": payload.get("language", None),
-        })
+        result = await audio_manager.process_audio_conversation(
+            audio_data,
+            lambda q, lc=None: call_agent_with_history(ws, q, lc),
+            input_language=in_lang,
+            output_language=out_lang,
+        )
+
+        if result["success"]:
+            resp = {
+                "type":           "audio_conversation_response",
+                "success":        True,
+                "input_text":     result["input_text"],
+                "input_language": result.get("input_language", in_lang),
+                "response_text":  result["response_text"],
+                "emotion":        result["response_emotion"],
+                "audio_data":     base64.b64encode(result["audio_data"]).decode("utf-8"),
+                "audio_format":   result["audio_format"],
+                "audio_duration": result["audio_duration"],
+                "stt_confidence": result["stt_confidence"],
+            }
+        else:
+            resp = {
+                "type":           "audio_conversation_response",
+                "success":        False,
+                "error":          result.get("error", "Processing failed"),
+                "input_text":     result.get("input_text", ""),
+                "response_text":  "",
+                "audio_data":     "",
+                "stt_confidence": result.get("stt_confidence", 0.0),
+            }
+        await _safe_send_json(ws, resp)
 
     except Exception as e:
-        await ws.send_json({
-            "type": "streaming_error",
-            "error": f"Audio streaming error: {str(e)}",
-            "stage": "general"
+        await _safe_send_json(ws, {"type": "error", "response": str(e), "emotion": "sad"})
+
+
+# ── Streaming audio (main path) ───────────────────────────────────────────────
+
+async def handle_audio_streaming(ws: WebSocket, payload: dict):
+    try:
+        raw = payload.get("audio_data", b"")
+        if not raw:
+            await _safe_send_json(ws, {"type": "error", "response": "No audio data", "emotion": "sad"})
+            return
+        await handle_audio_base64_streaming(ws, {
+            "audio_data":     base64.b64encode(raw).decode("utf-8"),
+            "input_language": payload.get("input_language", "auto"),
+            "output_language": payload.get("output_language", "en"),
+            "language":       payload.get("language"),
         })
+    except Exception as e:
+        await _safe_send_json(ws, {"type": "streaming_error", "error": str(e), "stage": "general"})
 
 
 async def handle_audio_base64_streaming(ws: WebSocket, payload: dict):
-    """Handle base64 audio with streaming TTS response.
-
-    The flow:
-      1. STT (Groq Whisper) → get text
-      2. Agent → get response text (with cache check)
-      3. Send text immediately to frontend
-      4. Stream TTS audio as binary WebSocket frames
+    """
+    Main voice pipeline with 30-second hard timeout.
+    Flow: STT → Agent (cached) → send text immediately → stream TTS.
+    Every send is crash-safe. Client disconnect is handled silently.
+    Tamil mode always uses Sarvam STT + TTS and enforces Tanglish responses.
     """
     try:
-        audio_base64 = payload.get("audio_data", "")
-        if not audio_base64:
-            await ws.send_json({
-                "type": "error",
-                "response": "No audio data provided",
-                "emotion": "sad"
-            })
-            return
-
-        pipeline_start = time.time()
-        audio_data = base64.b64decode(audio_base64)
-
-        # Use language from frontend if provided, else auto
-        user_language = payload.get("language", None) or payload.get("input_language", "auto")
-
-        print(f"[WS] Streaming audio: {len(audio_data)} bytes, language={user_language}")
-
-        audio_mgr = get_audio_manager()
-
-        # Step 1: STT Processing
-        stt_start = time.time()
-        stt_result = await audio_mgr.process_audio_to_text(audio_data, user_language)
-        stt_duration = (time.time() - stt_start) * 1000
-        print(f"[WS] ⏱️ STT took {stt_duration:.1f}ms")
-
-        if not stt_result["success"]:
-            await ws.send_json({
-                "type": "streaming_error",
-                "error": stt_result.get("error", "STT failed"),
-                "stage": "stt"
-            })
-            return
-
-        input_text = stt_result["text"]
-        detected_language = stt_result.get("language", "unknown")
-        is_tamil = stt_result.get("is_tamil", False)
-
-        language_context = {
-            "language": detected_language,
-            "is_tamil": is_tamil,
-            "confidence": stt_result["confidence"]
-        }
-
-        print(f"[WS] STT Complete: '{input_text}' (detected: {detected_language})")
-
-        # Step 2: Send immediate acknowledgment
-        await ws.send_json({
-            "type": "streaming_status",
-            "stage": "processing",
-            "input_text": input_text,
-            "message": "Processing your query..."
+        await asyncio.wait_for(
+            _audio_pipeline(ws, payload),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        print("[WS] ⏰ 30s timeout — pipeline aborted")
+        await _safe_send_json(ws, {
+            "type":  "streaming_error",
+            "error": "Request timed out. Please try again.",
+            "stage": "timeout",
+        })
+    except (WebSocketDisconnect, RuntimeError):
+        print("[WS] Client disconnected during pipeline")
+    except Exception as e:
+        print(f"[WS] Pipeline error: {e}")
+        await _safe_send_json(ws, {
+            "type":  "streaming_error",
+            "error": "An unexpected error occurred. Please try again.",
+            "stage": "general",
         })
 
-        # Agent Processing (with cache — all queries cached)
-        cached = _get_cached_response(input_text)
-        if cached:
-            agent_result = cached.copy()
-            agent_duration = 0.0
-            print(f"[WS] ⚡ Agent cache HIT (~0ms)")
-        else:
-            agent_start = time.time()
-            agent_result = await call_agent_with_history(ws, input_text, language_context)
-            agent_duration = (time.time() - agent_start) * 1000
-            _cache_response(input_text, agent_result)
-            print(f"[WS] ⏱️ Agent took {agent_duration:.1f}ms (cached)")
 
-        if not isinstance(agent_result, dict):
-            await ws.send_json({
-                "type": "streaming_error",
-                "error": "Invalid agent response",
-                "stage": "agent"
-            })
-            return
+async def _audio_pipeline(ws: WebSocket, payload: dict):
+    """Inner pipeline — run inside a 30-second asyncio.wait_for."""
 
-        response_text = agent_result.get("response", "")
-        response_emotion = agent_result.get("emotion", "none")
+    # ── Decode audio ──────────────────────────────────────────────────────
+    raw_b64 = payload.get("audio_data", "")
+    if not raw_b64:
+        await _safe_send_json(ws, {"type": "error", "response": "No audio data provided", "emotion": "sad"})
+        return
 
-        print(f"[WS] Agent Complete: '{response_text[:50]}...'")
+    try:
+        audio_data = base64.b64decode(raw_b64)
+    except Exception:
+        await _safe_send_json(ws, {"type": "streaming_error", "error": "Invalid audio encoding", "stage": "decode"})
+        return
 
-        # Step 4: Send TEXT IMMEDIATELY to frontend
-        resolved_output_language = detect_language(response_text)
-        await ws.send_json({
-            "type": "streaming_text_response",
-            "success": True,
-            "input_text": input_text,
-            "input_language": detected_language,
-            "response_text": response_text,
-            "emotion": response_emotion,
-            "stt_confidence": stt_result["confidence"],
-            "is_tamil": is_tamil,
-            "audio_processing": "in_progress"
+    # Validate minimum size
+    if len(audio_data) < 1000:
+        await _safe_send_json(ws, {"type": "streaming_error", "error": "Audio clip too short", "stage": "decode"})
+        return
+
+    raw_lang  = payload.get("language") or payload.get("input_language", "auto")
+    user_lang = _normalise_lang(raw_lang)
+
+    print(f"[WS] 🎤 Audio {len(audio_data)}B lang={user_lang}")
+    mgr = get_audio_manager()
+    t_pipeline = time.perf_counter()
+
+    # ── STT ───────────────────────────────────────────────────────────────
+    t_stt      = time.perf_counter()
+    stt_result = await mgr.process_audio_to_text(audio_data, user_lang)
+    stt_ms     = (time.perf_counter() - t_stt) * 1000
+    print(f"[WS] STT {stt_ms:.0f}ms | provider={stt_result.get('provider','?')}")
+
+    if not stt_result.get("success") or not stt_result.get("text", "").strip():
+        err = stt_result.get("error") or "No speech detected — please speak clearly and try again."
+        await _safe_send_json(ws, {"type": "streaming_error", "error": err, "stage": "stt"})
+        return
+
+    input_text   = stt_result["text"].strip()
+    lang_code    = stt_result.get("language", "en")
+    is_tamil     = bool(stt_result.get("is_tamil", False))
+    # If user explicitly selected Tamil mode, always enforce it
+    if user_lang == "ta":
+        is_tamil  = True
+        lang_code = "ta"
+
+    lang_ctx = {"language": lang_code, "is_tamil": is_tamil, "confidence": stt_result.get("confidence", 0.9)}
+    print(f"[WS] STT: '{input_text[:60]}' lang={lang_code} tamil={is_tamil}")
+
+    # ── Immediate ACK ─────────────────────────────────────────────────────
+    await _safe_send_json(ws, {
+        "type":       "streaming_status",
+        "stage":      "processing",
+        "input_text": input_text,
+        "message":    "Processing your query...",
+    })
+
+    # ── Agent (LRU cache) ─────────────────────────────────────────────────
+    cached = _get_cached_response(input_text)
+    if cached:
+        agent_result = cached.copy()
+        print("[WS] ⚡ Cache HIT")
+    else:
+        t_agent      = time.perf_counter()
+        agent_result = await call_agent_with_history(ws, input_text, lang_ctx)
+        agent_ms     = (time.perf_counter() - t_agent) * 1000
+        _cache_response(input_text, agent_result)
+        print(f"[WS] Agent {agent_ms:.0f}ms")
+
+    if not isinstance(agent_result, dict) or not agent_result.get("response"):
+        await _safe_send_json(ws, {
+            "type":  "streaming_error",
+            "error": "Agent could not generate a response. Please try again.",
+            "stage": "agent",
         })
+        return
 
-        print(f"[WS] ✅ Text response sent immediately")
+    response_text    = str(agent_result.get("response", "")).strip()
+    response_emotion = agent_result.get("emotion", "none")
+    if response_emotion not in ("happy", "sad", "none"):
+        response_emotion = "none"
 
-        # Step 5: Stream TTS audio as binary WebSocket frames
-        print(f"[WS] TTS language auto-detected from response: {resolved_output_language}")
+    # Tanglish is all-Latin — Unicode scan returns 'en'; use is_tamil flag
+    tts_lang = "ta" if is_tamil else detect_language(response_text)
+    print(f"[WS] Resp: '{response_text[:60]}' tts_lang={tts_lang}")
 
+    # ── Send text IMMEDIATELY ─────────────────────────────────────────────
+    await _safe_send_json(ws, {
+        "type":             "streaming_text_response",
+        "success":          True,
+        "input_text":       input_text,
+        "input_language":   lang_code,
+        "response_text":    response_text,
+        "emotion":          response_emotion,
+        "stt_confidence":   stt_result.get("confidence", 0.9),
+        "is_tamil":         is_tamil,
+        "audio_processing": "in_progress",
+    })
+    print("[WS] ✅ Text dispatched")
+
+    # ── TTS stream ────────────────────────────────────────────────────────
+    t_tts = time.perf_counter()
+    try:
+        await _safe_send_json(ws, {
+            "type":     "audio_stream_start",
+            "format":   "wav" if tts_lang == "ta" else "mp3",
+            "language": tts_lang,
+        })
+        await mgr.stream_tts_to_websocket(
+            text=response_text,
+            language=tts_lang,
+            websocket=ws,
+        )
+        tts_ms    = (time.perf_counter() - t_tts) * 1000
+        total_ms  = (time.perf_counter() - t_pipeline) * 1000
+        await _safe_send_json(ws, {
+            "type":              "audio_stream_end",
+            "audio_processing":  "complete",
+            "duration_ms":       tts_ms,
+            "total_pipeline_ms": total_ms,
+        })
+        print(f"[WS] ✅ Pipeline {total_ms:.0f}ms (STT {stt_ms:.0f}ms | TTS {tts_ms:.0f}ms)")
+
+    except (WebSocketDisconnect, RuntimeError):
+        print("[WS] Client disconnected during TTS stream")
+
+    except Exception as tts_err:
+        # TTS stream failed — attempt single-shot fallback
+        print(f"[WS] TTS stream failed ({tts_err}), single-shot fallback")
         try:
-            tts_start = time.time()
-
-            # Signal frontend that audio stream is starting
-            await ws.send_json({
-                "type": "audio_stream_start",
-                "format": "mp3",
-                "language": resolved_output_language
-            })
-
-            # Stream Edge TTS audio chunks as binary frames
-            await audio_mgr.stream_tts_to_websocket(
-                text=response_text,
-                language=resolved_output_language,
-                websocket=ws
+            fb = await asyncio.wait_for(
+                mgr.process_text_to_audio(response_text, tts_lang, response_emotion),
+                timeout=12.0,
             )
-
-            tts_duration = (time.time() - tts_start) * 1000
-
-            # Signal frontend that audio stream is complete
-            total_pipeline_ms = (time.time() - pipeline_start) * 1000
-            await ws.send_json({
-                "type": "audio_stream_end",
-                "audio_processing": "complete",
-                "duration_ms": tts_duration,
-                "total_pipeline_ms": total_pipeline_ms
-            })
-
-            print(f"[WS] ✅ Audio streamed in {tts_duration:.0f}ms | Total pipeline: {total_pipeline_ms:.0f}ms")
-
-        except Exception as tts_error:
-            print(f"[WS] TTS streaming failed, falling back: {tts_error}")
-
-            # Fallback: synthesize entire text and send as base64
-            tts_result = await audio_mgr.process_text_to_audio(
-                response_text,
-                resolved_output_language,
-                response_emotion
-            )
-
-            if tts_result["success"]:
-                audio_base64_resp = base64.b64encode(tts_result["audio_data"]).decode('utf-8')
-
-                await ws.send_json({
-                    "type": "streaming_audio_chunk",
-                    "chunk_id": 0,
-                    "total_chunks": 1,
-                    "text_chunk": response_text,
-                    "audio_data": audio_base64_resp,
-                    "audio_format": tts_result.get("format", "mp3"),
-                    "audio_duration": tts_result.get("duration", 0.0),
-                    "output_language": resolved_output_language,
-                    "is_final": True,
-                    "audio_processing": "complete"
+            if fb.get("success"):
+                await _safe_send_json(ws, {
+                    "type":             "streaming_audio_chunk",
+                    "chunk_id":         0,
+                    "total_chunks":     1,
+                    "audio_data":       base64.b64encode(fb["audio_data"]).decode("utf-8"),
+                    "audio_format":     fb.get("format", "mp3"),
+                    "is_final":         True,
+                    "audio_processing": "complete",
                 })
             else:
-                await ws.send_json({
-                    "type": "streaming_audio_error",
-                    "error": f"TTS fallback failed: {tts_result.get('error', 'Unknown error')}",
-                    "audio_processing": "failed"
+                await _safe_send_json(ws, {
+                    "type":             "streaming_audio_error",
+                    "error":            "TTS unavailable",
+                    "audio_processing": "failed",
                 })
+        except asyncio.TimeoutError:
+            await _safe_send_json(ws, {
+                "type":             "streaming_audio_error",
+                "error":            "TTS timed out",
+                "audio_processing": "failed",
+            })
+        except Exception:
+            pass  # Text already shown — audio is best-effort
 
-    except Exception as e:
-        await ws.send_json({
-            "type": "streaming_error",
-            "error": f"Streaming processing error: {str(e)}",
-            "stage": "general"
-        })
 
+# ── TTS-only streaming ────────────────────────────────────────────────────────
 
 async def handle_tts_streaming(ws: WebSocket, payload: dict):
-    """Handle text-to-speech streaming by sentences"""
     try:
         text = payload.get("text", "").strip()
         if not text:
-            await ws.send_json({
-                "type": "error",
-                "response": "No text provided for TTS",
-                "emotion": "sad"
-            })
+            await _safe_send_json(ws, {"type": "error", "response": "No text provided for TTS", "emotion": "sad"})
             return
 
-        language = payload.get("language", "en")
-        emotion = payload.get("emotion", "none")
-
-        print(f"[WS] TTS Streaming: '{text[:50]}...' (lang: {language})")
-
+        language  = _normalise_lang(payload.get("language", "en"))
+        if language == "auto":
+            language = "en"
+        emotion   = payload.get("emotion", "none")
         sentences = split_text_into_sentences(text)
-
-        print(f"[WS] Streaming {len(sentences)} sentences...")
-
-        audio_mgr = get_audio_manager()
+        mgr       = get_audio_manager()
 
         for i, sentence in enumerate(sentences):
-            print(f"   📝 Sentence {i+1}: '{sentence}'")
-
             try:
-                tts_result = await audio_mgr.process_text_to_audio(
-                    text=sentence,
-                    language=language,
-                    emotion=emotion
-                )
-
-                if tts_result["success"]:
-                    audio_base64_chunk = base64.b64encode(tts_result["audio_data"]).decode('utf-8')
-
-                    await ws.send_json({
-                        "type": "streaming_tts_chunk",
-                        "chunk_id": i,
-                        "total_chunks": len(sentences),
-                        "text_chunk": sentence,
-                        "audio_data": audio_base64_chunk,
-                        "audio_format": tts_result.get("format", "mp3"),
-                        "is_final": (i == len(sentences) - 1),
-                        "chunk_duration": tts_result.get("duration", 0.0)
+                result = await mgr.process_text_to_audio(sentence, language, emotion)
+                if result["success"]:
+                    await _safe_send_json(ws, {
+                        "type":           "streaming_tts_chunk",
+                        "chunk_id":       i,
+                        "total_chunks":   len(sentences),
+                        "text_chunk":     sentence,
+                        "audio_data":     base64.b64encode(result["audio_data"]).decode("utf-8"),
+                        "audio_format":   result.get("format", "mp3"),
+                        "is_final":       (i == len(sentences) - 1),
+                        "chunk_duration": result.get("duration", 0.0),
                     })
-
-                    print(f"   ✅ Streamed sentence {i+1}/{len(sentences)}")
-
                 else:
-                    print(f"   ❌ TTS failed for sentence {i+1}: {tts_result.get('error')}")
-                    await ws.send_json({
+                    await _safe_send_json(ws, {
                         "type": "streaming_tts_error",
                         "chunk_id": i,
-                        "error": tts_result.get("error", "TTS failed"),
-                        "text_chunk": sentence
+                        "error": result.get("error", "TTS failed"),
+                        "text_chunk": sentence,
                     })
-
-            except Exception as sentence_error:
-                print(f"   ❌ Error processing sentence {i+1}: {sentence_error}")
-                await ws.send_json({
+            except Exception as e:
+                await _safe_send_json(ws, {
                     "type": "streaming_tts_error",
                     "chunk_id": i,
-                    "error": str(sentence_error),
-                    "text_chunk": sentence
+                    "error": str(e),
+                    "text_chunk": sentence,
                 })
 
-        await ws.send_json({
-            "type": "streaming_tts_complete",
-            "total_chunks_processed": len(sentences)
+        await _safe_send_json(ws, {
+            "type":                  "streaming_tts_complete",
+            "total_chunks_processed": len(sentences),
         })
-
-        print("🎵 All sentences streamed!")
 
     except Exception as e:
-        await ws.send_json({
-            "type": "streaming_error",
-            "error": f"TTS streaming error: {str(e)}",
-            "stage": "tts_streaming"
-        })
+        await _safe_send_json(ws, {"type": "streaming_error", "error": str(e), "stage": "tts_streaming"})
 
 
 def split_text_into_sentences(text: str):
-    """Split text into complete sentences for streaming TTS"""
-    import re
-
-    # Handle common abbreviations to avoid false splits
-    text = text.replace("Mr.", "Mr").replace("Dr.", "Dr")
+    text = text.replace("Mr.", "Mr").replace("Dr.", "Dr").replace("etc.", "etc")
     text = text.replace("A.M.", "AM").replace("P.M.", "PM")
-    text = text.replace("etc.", "etc")
-
-    # Split by sentence-ending punctuation
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-
-    processed_sentences = []
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    result = []
+    for s in parts:
+        s = s.strip()
+        if not s:
             continue
-
-        # Restore abbreviations
-        sentence = sentence.replace("Mr", "Mr.").replace("Dr", "Dr.")
-        sentence = sentence.replace("AM", "A.M.").replace("PM", "P.M.")
-        sentence = sentence.replace("etc", "etc.")
-
-        # Combine very short sentences with the previous one
-        if len(sentence.split()) < 4 and processed_sentences:
-            processed_sentences[-1] += " " + sentence
+        s = s.replace("Mr", "Mr.").replace("Dr", "Dr.").replace("etc", "etc.")
+        s = s.replace("AM", "A.M.").replace("PM", "P.M.")
+        if len(s.split()) < 4 and result:
+            result[-1] += " " + s
         else:
-            processed_sentences.append(sentence)
+            result.append(s)
+    return result or [text]
 
-    if not processed_sentences:
-        processed_sentences = [text]
 
-    return processed_sentences
-
+# ── Misc handlers ─────────────────────────────────────────────────────────────
 
 async def handle_test_immediate(ws: WebSocket, payload: dict):
-    """Test immediate response functionality - bypass all processing"""
-    import asyncio
-
-    test_message = payload.get("message", "Test message")
-
-    await ws.send_json({
-        "type": "test_immediate_response",
-        "message": f"Immediate: {test_message}",
-        "timestamp": time.time(),
-        "status": "immediate_sent"
-    })
-
-    print(f"[WS] ✅ Test immediate response sent")
-
+    msg = payload.get("message", "Test message")
+    await _safe_send_json(ws, {"type": "test_immediate_response", "message": f"Immediate: {msg}", "timestamp": time.time()})
     for i in range(3):
         await asyncio.sleep(1)
-        await ws.send_json({
-            "type": "test_progress",
-            "step": i + 1,
-            "message": f"Processing step {i + 1}/3",
-            "timestamp": time.time()
-        })
-        print(f"[WS] Test progress step {i + 1}/3 sent")
-
-    await ws.send_json({
-        "type": "test_final_response",
-        "message": f"Final response for: {test_message}",
-        "timestamp": time.time(),
-        "status": "complete"
-    })
-
-    print(f"[WS] ✅ Test final response sent")
+        await _safe_send_json(ws, {"type": "test_progress", "step": i + 1, "timestamp": time.time()})
+    await _safe_send_json(ws, {"type": "test_final_response", "message": f"Final: {msg}", "timestamp": time.time()})
 
 
 async def handle_audio_info_request(ws: WebSocket):
-    """Handle request for audio capabilities info"""
-    info = audio_manager.get_supported_formats()
-    await ws.send_json({
-        "type": "audio_info_response",
-        "info": info
-    })
+    await _safe_send_json(ws, {"type": "audio_info_response", "info": audio_manager.get_supported_formats()})
 
 
 async def handle_voices_request(ws: WebSocket, payload: dict):
-    """Handle request for available voices"""
     language = payload.get("language", "en")
-    voices = await audio_manager.get_voice_options(language)
-    await ws.send_json({
-        "type": "voices_response",
-        "voices": voices
-    })
+    voices   = await audio_manager.get_voice_options(language)
+    await _safe_send_json(ws, {"type": "voices_response", "voices": voices})
 
 
-# Keep backward compatibility — handle "audio" type same as audio_base64
 async def handle_audio_query(ws: WebSocket, payload: dict):
-    """Handle audio query (alias for audio_base64)"""
+    """Alias: audio → audio_base64."""
     await handle_audio_base64_query(ws, payload)

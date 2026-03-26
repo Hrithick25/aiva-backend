@@ -1,6 +1,11 @@
 """
-Text-to-Speech module using Microsoft Edge TTS exclusively.
-Supports English, Tamil, and Hindi with streaming audio.
+Text-to-Speech module.
+
+Routing:
+  • Tamil mode (language="ta") → Sarvam bulbul:v2 (natural Tanglish TTS)
+      Falls back to Edge TTS (ta-IN-PallaviNeural) if SARVAM_API_KEY not set.
+  • English (language="en")    → Edge TTS en-US-JennyNeural (warmer, human-like)
+  • Hindi (language="hi")      → Edge TTS hi-IN-AnanyaNeural (warm Indian voice)
 """
 import asyncio
 import logging
@@ -8,18 +13,28 @@ import re
 from typing import Optional, Dict, Any, List
 
 import edge_tts
+from audio.sarvam import synthesize_tamil, synthesize_tamil_stream, is_configured as sarvam_configured
 
 logger = logging.getLogger(__name__)
 
 
 class TTSProcessor:
     def __init__(self):
-        """Initialize TTS processor with Edge TTS voices for en, ta, hi."""
-        # Edge TTS voice mapping by language
+        """Initialize TTS with warm, human-like voices for each language."""
+        # Edge TTS voice mapping
+        # en-US-JennyNeural: warm, conversational assistant tone — most human-sounding
+        # hi-IN-AnanyaNeural: natural warm Indian female voice
+        # ta-IN-PallaviNeural: Tamil fallback (Sarvam is primary for Tamil)
         self.voice_mapping = {
-            "en": "en-US-AriaNeural",
+            "en": "en-US-JennyNeural",
             "ta": "ta-IN-PallaviNeural",
-            "hi": "hi-IN-SwaraNeural",
+            "hi": "hi-IN-AnanyaNeural",
+        }
+        # Prosody settings — slightly slower rate sounds more natural/thoughtful
+        self.prosody = {
+            "en": {"rate": "-5%",  "pitch": "+2Hz"},  # warm, calm pace
+            "hi": {"rate": "-5%",  "pitch": "+0Hz"},  # natural Hindi pace
+            "ta": {"rate": "-8%",  "pitch": "+0Hz"},  # Tamil fallback (slower)
         }
 
     async def synthesize_speech(
@@ -30,30 +45,39 @@ class TTSProcessor:
         emotion: str = "none",
     ) -> Dict[str, Any]:
         """
-        Convert text to speech using Edge TTS.
-
-        Args:
-            text: Text to synthesize
-            language: Language code ("en", "ta", "hi")
-            voice: Specific voice name override (optional)
-            emotion: (unused, kept for interface compat)
-
-        Returns:
-            Dict with audio data and metadata
+        Convert text to speech.
+        Tamil mode → Sarvam bulbul:v2 (with Edge TTS fallback).
+        English/Hindi → Edge TTS.
         """
         resolved_lang = (language or "en").strip().lower()
+
+        # ── Tamil: prefer Sarvam ──────────────────────────────────────
+        if resolved_lang == "ta" and sarvam_configured():
+            logger.info("[TTS] Tamil mode → Sarvam bulbul:v2")
+            result = synthesize_tamil(text)
+            if result["success"]:
+                return result
+            logger.warning("[TTS] Sarvam TTS failed, falling back to Edge TTS")
+
+        # ── Edge TTS (English / Hindi / Tamil fallback) ───────────────
         selected_voice = voice or self.voice_mapping.get(
             resolved_lang, self.voice_mapping["en"]
         )
 
         last_error = None
-        for attempt in range(3):  # up to 3 attempts
+        for attempt in range(3):
             try:
+                prosody = self.prosody.get(resolved_lang, self.prosody["en"])
                 logger.info(
-                    f"Synthesizing with Edge TTS (attempt {attempt+1}): voice={selected_voice}, lang={resolved_lang}"
+                    f"[TTS] Edge TTS attempt {attempt+1}: voice={selected_voice} "
+                    f"rate={prosody['rate']} pitch={prosody['pitch']}"
                 )
-
-                communicate = edge_tts.Communicate(text=text, voice=selected_voice)
+                communicate = edge_tts.Communicate(
+                    text=text,
+                    voice=selected_voice,
+                    rate=prosody["rate"],
+                    pitch=prosody["pitch"],
+                )
                 audio_bytes = b""
 
                 async def _collect():
@@ -67,35 +91,34 @@ class TTSProcessor:
                 if not audio_bytes:
                     raise Exception("Edge TTS returned empty audio")
 
-                duration = self._estimate_duration(text)
-
                 return {
-                    "success": True,
+                    "success":    True,
                     "audio_data": audio_bytes,
-                    "format": "mp3",
-                    "voice": selected_voice,
-                    "language": resolved_lang,
-                    "duration": duration,
-                    "size": len(audio_bytes),
-                    "provider": "edge_tts",
+                    "format":     "mp3",
+                    "voice":      selected_voice,
+                    "language":   resolved_lang,
+                    "duration":   self._estimate_duration(text),
+                    "size":       len(audio_bytes),
+                    "provider":   "edge_tts",
                 }
             except asyncio.TimeoutError:
                 last_error = "Edge TTS timed out after 30s"
-                logger.warning(f"Edge TTS attempt {attempt+1} timed out, retrying...")
+                logger.warning(f"[TTS] attempt {attempt+1} timed out, retrying...")
                 await asyncio.sleep(0.5 * (attempt + 1))
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"Edge TTS attempt {attempt+1} failed: {last_error}, retrying...")
+                logger.warning(f"[TTS] attempt {attempt+1} failed: {last_error}")
                 await asyncio.sleep(0.5 * (attempt + 1))
 
-        logger.error(f"Edge TTS synthesis failed after 3 attempts: {last_error}")
+        logger.error(f"[TTS] Edge TTS failed after 3 attempts: {last_error}")
         return {
-            "success": False,
-            "error": last_error,
+            "success":    False,
+            "error":      last_error,
             "audio_data": b"",
-            "format": "mp3",
-            "provider": "edge_tts",
+            "format":     "mp3",
+            "provider":   "edge_tts",
         }
+
 
     # Edge TTS silently truncates text above ~1 000 chars.
     # This limit keeps each chunk safely within that boundary.
@@ -175,32 +198,34 @@ class TTSProcessor:
         return [s for s in segments if s]
 
     async def stream_edge_tts(self, text: str, language: str, websocket):
-        """Stream Edge TTS audio chunks directly to a WebSocket as binary frames.
+        """Stream TTS audio to a WebSocket.
 
-        Splits long text into safe segments (≤800 chars) before calling Edge TTS
-        to prevent the silent mid-sentence truncation that occurs above ~1 000 chars.
-        Each segment is streamed sequentially; retries up to 3 times per segment.
-
-        Method name and signature are unchanged — no other files need modification.
-
-        Args:
-            text: Text to synthesize (any length)
-            language: Language code ("en", "ta", "hi")
-            websocket: FastAPI WebSocket instance
+        Tamil mode → Sarvam bulbul:v2 chunked WAV (with Edge TTS fallback).
+        English/Hindi → Edge TTS MP3 stream.
         """
-        resolved_lang  = (language or "en").strip().lower()
-        selected_voice = self.voice_mapping.get(resolved_lang, self.voice_mapping["en"])
+        resolved_lang = (language or "en").strip().lower()
 
-        segments = self._split_for_edge_tts(text)
+        # ── Tamil: prefer Sarvam ──────────────────────────────────────
+        if resolved_lang == "ta" and sarvam_configured():
+            logger.info("[TTS stream] Tamil → Sarvam bulbul:v2")
+            try:
+                await synthesize_tamil_stream(text, websocket)
+                return
+            except Exception as e:
+                logger.warning(f"[TTS stream] Sarvam failed: {e}, falling back to Edge TTS")
+
+        # ── Edge TTS (English / Hindi / Tamil fallback) ───────────────
+        selected_voice = self.voice_mapping.get(resolved_lang, self.voice_mapping["en"])
+        prosody        = self.prosody.get(resolved_lang, self.prosody["en"])
+        segments       = self._split_for_edge_tts(text)
         if not segments:
-            logger.warning("[TTS] stream_edge_tts called with empty text — skipping")
+            logger.warning("[TTS stream] Empty text — skipping")
             return
 
         logger.info(
-            "[TTS] Streaming %d segment(s) via Edge TTS | voice=%s | lang=%s",
-            len(segments), selected_voice, resolved_lang,
+            "[TTS stream] %d segment(s) via Edge TTS | voice=%s rate=%s",
+            len(segments), selected_voice, prosody["rate"],
         )
-
         total_bytes_all = 0
 
         for seg_idx, segment in enumerate(segments):
@@ -209,7 +234,12 @@ class TTSProcessor:
 
             for attempt in range(3):
                 try:
-                    communicate = edge_tts.Communicate(text=segment, voice=selected_voice)
+                    communicate = edge_tts.Communicate(
+                        text=segment,
+                        voice=selected_voice,
+                        rate=prosody["rate"],
+                        pitch=prosody["pitch"],
+                    )
                     seg_bytes = 0
 
                     async def _stream_segment():
@@ -263,20 +293,24 @@ class TTSProcessor:
         """Get list of available voices for a language."""
         voices_info = {
             "en": [
-                {"name": "en-US-AriaNeural", "gender": "Female", "description": "US English, expressive"}
+                {"name": "en-US-JennyNeural",  "gender": "Female",
+                 "description": "US English, warm conversational — most human-like"},
             ],
             "ta": [
-                {"name": "ta-IN-PallaviNeural", "gender": "Female", "description": "Tamil, natural"}
+                {"name": "Sarvam bulbul:v2 (ananya)", "gender": "Female",
+                 "description": "Tamil/Tanglish, natural Indian accent"},
+                {"name": "ta-IN-PallaviNeural", "gender": "Female",
+                 "description": "Tamil Edge TTS fallback"},
             ],
             "hi": [
-                {"name": "hi-IN-SwaraNeural", "gender": "Female", "description": "Hindi, natural"}
+                {"name": "hi-IN-AnanyaNeural", "gender": "Female",
+                 "description": "Hindi, warm natural Indian voice"},
             ],
         }
-
         return {
             "provider": "edge_tts",
             "language": language,
-            "voices": voices_info.get(language, voices_info["en"]),
+            "voices":   voices_info.get(language, voices_info["en"]),
         }
 
     def validate_text_input(self, text: str) -> Dict[str, Any]:

@@ -17,9 +17,27 @@ class AudioManager:
         self.tts_processor = get_tts_processor()
 
     @staticmethod
+    def _resolve_tts_language(response_text: str, is_tamil: bool = False) -> str:
+        """
+        Resolve the TTS output language.
+
+        Priority:
+          1. If STT confirmed Tamil (is_tamil=True), use 'ta' — Tanglish text is
+             all-Latin so Unicode scanning would wrongly return 'en'.
+          2. Otherwise scan for Hindi Devanagari Unicode blocks.
+          3. Default to 'en'.
+        """
+        if is_tamil:
+            return "ta"
+        for char in response_text:
+            if '\u0900' <= char <= '\u097F':
+                return "hi"
+        return "en"
+
+    # ── Keep _detect_language for legacy HTML/text calls ──────────────────────
+    @staticmethod
     def _detect_language(text: str) -> str:
-        """Detect language from text by checking for Tamil / Hindi Unicode characters.
-        Returns 'ta' if Tamil script found, 'hi' if Devanagari found, else 'en'."""
+        """Legacy: detect language from Unicode chars (does NOT work for Tanglish)."""
         for char in text:
             if '\u0B80' <= char <= '\u0BFF':
                 return "ta"
@@ -209,9 +227,9 @@ class AudioManager:
             logger.info(f"Final response text for TTS: '{response_text[:50]}...'")
             
             # Step 3: Convert response to speech
-            # Auto-detect Tamil from response text instead of relying on output_language param
-            resolved_output_language = self._detect_language(response_text)
-            logger.info(f"TTS language auto-detected from response: {resolved_output_language}")
+            # Use is_tamil from STT (not Unicode char scan) so Tanglish works correctly
+            resolved_output_language = self._resolve_tts_language(response_text, is_tamil)
+            logger.info(f"[TTS] Language resolved: {resolved_output_language} (is_tamil={is_tamil})")
 
             tts_result = await self.process_text_to_audio(
                 response_text, 

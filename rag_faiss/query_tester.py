@@ -7,14 +7,6 @@ Provides detailed analysis of embedding similarity, chunk retrieval, and perform
 
 Usage:
     python query_tester.py
-    
-Features:
-- Interactive query input
-- Detailed embedding analysis  
-- Similarity scores and distances
-- Retrieved chunk preview
-- Performance benchmarking
-- Batch query testing
 """
 
 import os
@@ -23,49 +15,40 @@ import time
 import numpy as np
 import pickle
 import faiss
-import google.generativeai as genai
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 try:
     from rag_faiss.config import (
-        GEMINI_API_KEY,
-        FAISS_INDEX_PATH, 
+        FAISS_INDEX_PATH,
         INDEX_MAP_PATH,
         PICKLES_DIR,
         TOP_K,
         HNSW_EF_SEARCH,
-        EMBEDDING_MODEL,
     )
+    from rag_faiss.embedder import embed_query as _embed_query_fn
 except ImportError:
     from config import (
-        GEMINI_API_KEY,
         FAISS_INDEX_PATH,
-        INDEX_MAP_PATH, 
+        INDEX_MAP_PATH,
         PICKLES_DIR,
         TOP_K,
         HNSW_EF_SEARCH,
-        EMBEDDING_MODEL,
     )
+    from embedder import embed_query as _embed_query_fn
 
 class QueryTester:
     def __init__(self):
-        """Initialize the Query Tester with FAISS index and embeddings."""
-        print("🚀 Initializing Query Tester...")
-        
-        # Configure Gemini
-        genai.configure(api_key=GEMINI_API_KEY)
-        
-        # Load FAISS index and mappings
+        """Initialize the Query Tester with FAISS index and local BGE embedder."""
+        print("🚀 Initializing Query Tester (local BGE embedder — no API keys needed)...")
         self.faiss_index = None
-        self.index_map = None
+        self.index_map   = None
         self.pickle_cache = {}
         self._load_index()
-        
-        print(f"✅ Loaded FAISS index with {self.faiss_index.ntotal} vectors")
-        print(f"✅ Index map contains {len(self.index_map)} mappings")
+        print(f"✅ FAISS index loaded: {self.faiss_index.ntotal} vectors")
+        print(f"✅ Index map: {len(self.index_map)} mappings")
         print("-" * 60)
 
     def _load_index(self):
@@ -85,14 +68,8 @@ class QueryTester:
             self.index_map = pickle.load(f)
 
     def _embed_query(self, text: str) -> np.ndarray:
-        """Generate embedding for query text."""
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=text,
-        )
-        vec = np.array([result["embedding"]], dtype=np.float32)
-        faiss.normalize_L2(vec)
-        return vec
+        """Embed using local BGE model — no API, no rate limits."""
+        return _embed_query_fn(text)
 
     def _load_pickle(self, pickle_filename: str) -> List[str]:
         """Load and cache pickle file contents."""

@@ -2,7 +2,6 @@ import json
 import os
 import hashlib
 import chromadb
-import google.generativeai as genai
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from chromadb.utils import embedding_functions
 from config.settings import (
@@ -12,14 +11,8 @@ from config.settings import (
     CHUNK_RESULTS,
     ROUTER_MAX_SOURCES,
     ROUTER_TEXT_LIMIT,
-    GEMINI_API_KEY,
 )
 
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-_router_model = genai.GenerativeModel("gemini-2.5-flash") if GEMINI_API_KEY else None
 _source_routing_context = {}
 _STATE_FILE = os.path.join(CHROMA_PERSIST_DIR, "knowledge_base_state.json")
 
@@ -117,50 +110,10 @@ def _strip_json_fences(text: str) -> str:
     return cleaned
 
 
-def _route_sources_with_gemini(query: str) -> list[str]:
+def _route_sources(query: str) -> list[str]:
+    """Return top-N sources. FAISS handles semantic matching — no LLM routing needed."""
     available_sources = list(_source_routing_context.keys())
-    if not available_sources:
-        return []
-
-    if _router_model is None:
-        return available_sources[:ROUTER_MAX_SOURCES]
-
-    source_context = "\n\n".join(
-        f"Source: {source_name}\nExcerpt:\n{context}"
-        for source_name, context in _source_routing_context.items()
-    )
-
-    prompt = f"""You are a routing classifier for a college knowledge base.
-Choose the best 1 or 2 sources that should be searched for the user's question.
-
-Rules:
-1. Return ONLY source names from the available list.
-2. Select up to 2 sources.
-3. Prefer sources that are semantically relevant, even if the user uses indirect wording or synonyms.
-4. If the question spans multiple topics, return the 2 most relevant sources.
-5. Output valid JSON with this schema:
-{{
-  "sources": ["SourceName1", "SourceName2"]
-}}
-
-Available sources:
-{source_context}
-
-User question: {query}
-"""
-
-    try:
-        response = _router_model.generate_content(prompt)
-        payload = json.loads(_strip_json_fences(response.text))
-    except Exception:
-        return available_sources[:ROUTER_MAX_SOURCES]
-
-    selected_sources = []
-    for source_name in payload.get("sources", []):
-        if source_name in _source_routing_context and source_name not in selected_sources:
-            selected_sources.append(source_name)
-
-    return selected_sources[:ROUTER_MAX_SOURCES] or available_sources[:ROUTER_MAX_SOURCES]
+    return available_sources[:ROUTER_MAX_SOURCES]
 
 
 def load_knowledge_base():
@@ -238,7 +191,7 @@ def query_knowledge_base(query: str, n_results: int = CHUNK_RESULTS) -> dict:
             embedding_function=ef,
         )
 
-    routed_sources = _route_sources_with_gemini(query)
+    routed_sources = _route_sources(query)
 
     if not routed_sources:
         return {"context": "", "sources": []}
