@@ -1,6 +1,11 @@
 """
-retriever.py – Load FAISS index once, then answer queries with
-sub-50 ms retrieval by looking up pickle chunks via the index map.
+retriever.py  –  Load FAISS index once; answer queries with fast sub-50ms retrieval.
+
+Embedding strategy (consistent with build_index.py):
+  • Single embedContent call per query (batchEmbedContents for 1 text adds overhead).
+  • Persistent HTTP session – reuses TLS/TCP connections.
+  • LRU embedding cache – identical queries skip the API entirely.
+  • Key rotation on 429.
 
 Usage (standalone test):
     python -m rag_faiss.retriever
@@ -8,6 +13,7 @@ Usage (standalone test):
 
 import os
 import pickle
+import time
 import numpy as np
 import faiss
 import requests
@@ -25,41 +31,46 @@ from rag_faiss.config import (
     EMBEDDING_MODEL,
 )
 
-# ── Gemini Embedding REST API ────────────────────────────────────────
-EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL}:embedContent"
-
 logger = logging.getLogger(__name__)
 
-# ── Module-level singletons (loaded once) ────────────────────────────
-_faiss_index: Optional[faiss.Index] = None
-_index_map: Optional[Dict[int, Tuple[str, int]]] = None
-_pickle_cache: Dict[str, List[str]] = {}
-_loaded_successfully: bool = False
+# ── Gemini Embedding REST endpoint ───────────────────────────────────────────
+_BASE      = "https://generativelanguage.googleapis.com/v1beta"
+EMBED_URL  = f"{_BASE}/{EMBEDDING_MODEL}:embedContent"
 
-# OPTIMIZED: Persistent HTTP session — reuses TCP/TLS connections (~50-150ms saved per call)
+# ── Module-level singletons (loaded once at startup) ─────────────────────────
+_faiss_index:       Optional[faiss.Index]             = None
+_index_map:         Optional[Dict[int, Tuple[str, int]]] = None
+_pickle_cache:      Dict[str, List[str]]               = {}
+_loaded_successfully: bool                             = False
+
+# Persistent HTTP session – reuses TLS/TCP (~50-150 ms saved per call)
 _http_session: Optional[requests.Session] = None
 
-# Embedding cache: avoid re-embedding the same query string
-_embed_cache: Dict[str, np.ndarray] = {}
-_EMBED_CACHE_MAX = 128
+# LRU embedding cache – skip API for repeated queries
+_embed_cache:     Dict[str, np.ndarray] = {}
+_EMBED_CACHE_MAX  = 256   # bumped from 128 for better hit rate
 
-# Key rotation index for query embedding
+# Key rotation state
 _embed_key_idx: int = 0
 
 
+# ── HTTP session factory ─────────────────────────────────────────────────────
+
 def _get_http_session() -> requests.Session:
-    """Get or create a persistent HTTP session with connection pooling."""
     global _http_session
     if _http_session is None:
         _http_session = requests.Session()
-        # Keep-alive is enabled by default in Session
-        _http_session.headers.update({"Connection": "keep-alive"})
+        _http_session.headers.update({
+            "Content-Type": "application/json",
+            "Connection":   "keep-alive",
+        })
     return _http_session
 
 
-def _ensure_loaded():
-    """Load FAISS index and index map into memory on first call.
-    Re-checks the filesystem until the index is successfully loaded."""
+# ── FAISS index loader ───────────────────────────────────────────────────────
+
+def _ensure_loaded() -> None:
+    """Load FAISS index and index map into memory on first call."""
     global _faiss_index, _index_map, _loaded_successfully
 
     if _loaded_successfully:
@@ -67,23 +78,29 @@ def _ensure_loaded():
 
     if not os.path.exists(FAISS_INDEX_PATH):
         logger.warning(
-            "FAISS index not found at %s. RAG will be disabled until the index is built.",
+            "[RETRIEVER] FAISS index not found at %s. "
+            "RAG disabled until the index is built.",
             FAISS_INDEX_PATH,
         )
         _faiss_index = None
-        _index_map = None
+        _index_map   = None
         return
 
-    _faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+    try:
+        _faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(INDEX_MAP_PATH, "rb") as f:
+            _index_map = pickle.load(f)
+        _loaded_successfully = True
+        logger.info("[RETRIEVER] ✅ FAISS index loaded (%d vectors)", _faiss_index.ntotal)
+    except Exception as exc:
+        logger.error("[RETRIEVER] ❌ Failed to load FAISS index: %s", exc)
+        _faiss_index = None
+        _index_map   = None
 
-    with open(INDEX_MAP_PATH, "rb") as f:
-        _index_map = pickle.load(f)
 
-    _loaded_successfully = True
-
+# ── Pickle chunk loader (cached) ─────────────────────────────────────────────
 
 def _load_pickle(pickle_filename: str) -> List[str]:
-    """Load a pickle file, caching it for repeat access."""
     if pickle_filename not in _pickle_cache:
         path = os.path.join(PICKLES_DIR, pickle_filename)
         with open(path, "rb") as f:
@@ -91,96 +108,129 @@ def _load_pickle(pickle_filename: str) -> List[str]:
     return _pickle_cache[pickle_filename]
 
 
+# ── Query embedder ───────────────────────────────────────────────────────────
+
 def _embed_query(text: str) -> np.ndarray:
-    """Embed a single query string with key rotation and local cache."""
+    """
+    Embed a single query string.
+    • Returns a (1, dim) float32 array, L2-normalised.
+    • Uses LRU cache to skip identical repeated queries.
+    • Rotates API keys on 429.
+    """
     global _embed_key_idx
 
-    # Cache hit → skip API call entirely
     cache_key = text.strip().lower()
     if cache_key in _embed_cache:
-        logger.info("[RETRIEVER] Embedding cache HIT")
+        logger.debug("[RETRIEVER] Embedding cache HIT")
         return _embed_cache[cache_key]
 
     session = _get_http_session()
     keys = GEMINI_API_KEYS if GEMINI_API_KEYS else ([GEMINI_API_KEY] if GEMINI_API_KEY else [])
     if not keys:
-        raise RuntimeError("No GEMINI_API_KEY configured")
+        raise RuntimeError("[RETRIEVER] No GEMINI_API_KEY configured")
 
-    last_err = None
-    for attempt in range(len(keys) * 2):
+    last_err: Optional[str] = None
+    max_attempts = len(keys) * 3
+
+    for attempt in range(max_attempts):
         key = keys[_embed_key_idx % len(keys)]
         try:
             resp = session.post(
                 EMBED_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": key,
-                },
+                headers={"x-goog-api-key": key},
                 json={
-                    "model": EMBEDDING_MODEL,
-                    "content": {"parts": [{"text": text}]},
+                    "model":    EMBEDDING_MODEL,
+                    "content":  {"parts": [{"text": text}]},
                     "taskType": "RETRIEVAL_QUERY",
                 },
-                timeout=(3, 10),  # 3s connect, 10s read
+                timeout=(4, 12),   # (connect_timeout, read_timeout)
             )
+
             if resp.status_code == 429:
-                logger.warning(f"[RETRIEVER] Key {_embed_key_idx % len(keys) + 1} rate-limited, rotating...")
+                logger.warning(
+                    "[RETRIEVER] Key %d/%d rate-limited, rotating …",
+                    _embed_key_idx % len(keys) + 1, len(keys),
+                )
                 _embed_key_idx += 1
                 last_err = "rate_limited"
+                # Back-off before the next attempt
+                time.sleep(2)
                 continue
+
             if not resp.ok:
-                logger.error(f"[RETRIEVER] Embed error {resp.status_code}: {resp.text[:500]}")
+                logger.error(
+                    "[RETRIEVER] Embed %d error → %s",
+                    resp.status_code, resp.text[:500],
+                )
             resp.raise_for_status()
+
             data = resp.json()
             if "embedding" in data:
                 values = data["embedding"]["values"]
             elif "embeddings" in data:
                 values = data["embeddings"][0]["values"]
             else:
-                raise RuntimeError(f"Unexpected embedding response shape: {list(data.keys())}")
+                raise RuntimeError(
+                    f"[RETRIEVER] Unexpected embed response keys: {list(data.keys())}"
+                )
+
             vec = np.array([values], dtype=np.float32)
             faiss.normalize_L2(vec)
 
-            # Store in cache
+            # Store in LRU cache
             if len(_embed_cache) >= _EMBED_CACHE_MAX:
                 oldest = next(iter(_embed_cache))
                 del _embed_cache[oldest]
             _embed_cache[cache_key] = vec
             return vec
-        except Exception as e:
-            last_err = str(e)
+
+        except requests.exceptions.HTTPError:
+            raise   # already logged above; let caller handle
+        except Exception as exc:
+            last_err = str(exc)
+            logger.warning("[RETRIEVER] Embed attempt %d failed: %s", attempt + 1, exc)
             _embed_key_idx += 1
 
-    raise RuntimeError(f"Embedding failed after {len(keys)*2} attempts: {last_err}")
+    raise RuntimeError(
+        f"[RETRIEVER] Embedding failed after {max_attempts} attempts: {last_err}"
+    )
 
+
+# ── Public retrieval API ─────────────────────────────────────────────────────
 
 def retrieve(query: str, top_k: int = TOP_K) -> dict:
     """
-    Retrieve the most relevant chunks for a query.
+    Find the top-k most relevant document chunks for a query.
 
     Returns:
         {
-            "context": "...concatenated chunk text...",
+            "context": "<concatenated chunk text>",
             "sources": ["Achievements.txt", ...]
         }
     """
+    import time as _time   # local import avoids polluting module namespace
+
     _ensure_loaded()
     if _faiss_index is None or _index_map is None:
-        return {
-            "context": "",
-            "sources": [],
-        }
+        logger.warning("[RETRIEVER] FAISS index not available – returning empty context")
+        return {"context": "", "sources": []}
 
+    t0 = _time.perf_counter()
     query_vec = _embed_query(query)
-    distances, ids = _faiss_index.search(query_vec, top_k)
+    embed_ms  = (_time.perf_counter() - t0) * 1000
 
-    chunks: List[str] = []
+    t1 = _time.perf_counter()
+    distances, ids = _faiss_index.search(query_vec, top_k)
+    search_ms = (_time.perf_counter() - t1) * 1000
+
+    logger.info("[RETRIEVER] embed=%.0fms  faiss=%.1fms", embed_ms, search_ms)
+
+    chunks:       List[str] = []
     sources_seen: List[str] = []
 
     for faiss_id in ids[0]:
         if faiss_id == -1:
             continue
-
         pickle_filename, chunk_idx = _index_map[int(faiss_id)]
         pickle_chunks = _load_pickle(pickle_filename)
         chunks.append(pickle_chunks[chunk_idx])
@@ -195,23 +245,28 @@ def retrieve(query: str, top_k: int = TOP_K) -> dict:
     }
 
 
-# ── Quick CLI test ───────────────────────────────────────────────────
+# ── Quick CLI smoke-test ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     import time
 
+    logging.basicConfig(level=logging.INFO)
     _ensure_loaded()
-    print(f"[RETRIEVER] FAISS index loaded: {_faiss_index.ntotal} vectors")
 
-    test_queries = [
-        "What awards did students win?",
-        "CSE Department BC cutoff mark?",
-    ]
+    if _faiss_index is None:
+        print("[RETRIEVER] ❌ No FAISS index found – run build_index first.")
+    else:
+        print(f"[RETRIEVER] Index loaded: {_faiss_index.ntotal} vectors")
 
-    for q in test_queries:
-        start = time.perf_counter()
-        result = retrieve(q)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        print(f"\nQuery: {q}")
-        print(f"Sources: {result['sources']}")
-        print(f"Latency: {elapsed_ms:.1f} ms")
-        print(f"Context (first 300 chars): {result['context'][:300]}")
+        test_queries = [
+            "What awards did students win?",
+            "CSE Department BC cutoff mark?",
+            "What are the hostel facilities?",
+        ]
+        for q in test_queries:
+            start  = time.perf_counter()
+            result = retrieve(q)
+            ms     = (time.perf_counter() - start) * 1000
+            print(f"\nQuery   : {q}")
+            print(f"Sources : {result['sources']}")
+            print(f"Latency : {ms:.1f} ms")
+            print(f"Context : {result['context'][:200]} …")
