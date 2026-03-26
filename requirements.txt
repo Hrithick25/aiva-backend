@@ -2,14 +2,14 @@ fastapi
 uvicorn[standard]
 websockets
 python-dotenv
-faiss-cpu
 numpy
 requests
 
-# Audio Processing Dependencies
-groq                          # Groq API for STT and LLM
-google-genai                  # Google Gemini API for TTS and AI chat
-google-generativeai           # Legacy Gemini library used in RAG
+# RAG & Embeddings
+faiss-cpu
+sentence-transformers
+torch
 
-# Edge TTS for enhanced voice synthesis
+# API & Audio
+groq
 edge-tts

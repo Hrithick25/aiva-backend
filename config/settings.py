@@ -15,8 +15,8 @@ ROUTER_TEXT_LIMIT        = 6000
 KNOWLEDGE_FILES = {
     "Dataset": os.path.join(BASE_DIR, "Dataset.txt"),
 }
-WEBSOCKET_HOST = "0.0.0.0"
-WEBSOCKET_PORT = 8000
+WEBSOCKET_HOST = os.getenv("HOST", "0.0.0.0")
+WEBSOCKET_PORT = int(os.getenv("PORT", "8000"))
 
 # ── Audio Processing Settings ─────────────────────────────────────────
 AUDIO_SETTINGS = {
@@ -31,7 +31,7 @@ AUDIO_SETTINGS = {
     # TTS: Edge TTS for English; Sarvam bulbul:v2 for Tamil
     "tts_provider":          "edge_tts",
     "tts_tamil_provider":    "sarvam",
-    "default_voice":         os.getenv("DEFAULT_VOICE", "en-US-AriaNeural"),
+    "default_voice":         os.getenv("DEFAULT_VOICE", "en-US-JennyNeural"),
     "speech_rate":           int(os.getenv("SPEECH_RATE", "150")),
     "default_tts_language":  os.getenv("DEFAULT_TTS_LANGUAGE", "en"),
 
