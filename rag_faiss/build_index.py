@@ -46,30 +46,40 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 
-BATCH_EMBED_URL = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL}:batchEmbedContents"
+EMBED_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/"
+    + EMBEDDING_MODEL
+    + ":embedContent"
+)
+
+
+def _embed_single(text: str, key: str) -> List[float]:
+    """Embed a single text using the embedContent endpoint."""
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "content": {"parts": [{"text": text}]},
+        "taskType": "RETRIEVAL_DOCUMENT",
+    }
+    resp = requests.post(
+        EMBED_URL_TEMPLATE,
+        params={"key": key},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]["values"]
 
 
 def _embed_texts(texts: List[str], batch_size: int = 20) -> np.ndarray:
-    """Embed texts using Gemini API with automatic key rotation on rate limits."""
+    """Embed texts using Gemini embedContent API with automatic key rotation on rate limits."""
     if not GEMINI_API_KEYS:
         raise RuntimeError("No GEMINI_API_KEY found. Set it in your .env file.")
 
     vecs: List[List[float]] = []
-    key_index = 0  # start with first key
+    key_index = 0
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-
-        requests_payload = [
-            {
-                "model": EMBEDDING_MODEL,
-                "content": {"parts": [{"text": text}]}
-            }
-            for text in batch
-        ]
-        payload = {"requests": requests_payload}
-
-        max_attempts = len(GEMINI_API_KEYS) * 3  # try each key up to 3 times
+    for i, text in enumerate(texts):
+        max_attempts = len(GEMINI_API_KEYS) * 3
         attempt = 0
         success = False
 
@@ -77,39 +87,31 @@ def _embed_texts(texts: List[str], batch_size: int = 20) -> np.ndarray:
             current_key = GEMINI_API_KEYS[key_index % len(GEMINI_API_KEYS)]
             key_label = f"Key {(key_index % len(GEMINI_API_KEYS)) + 1}/{len(GEMINI_API_KEYS)}"
 
-            resp = requests.post(
-                BATCH_EMBED_URL,
-                params={"key": current_key},
-                json=payload,
-                timeout=30,
-            )
-
-            if resp.status_code == 429:
-                attempt += 1
-                key_index += 1  # rotate to next key
-                next_key_label = f"Key {(key_index % len(GEMINI_API_KEYS)) + 1}/{len(GEMINI_API_KEYS)}"
-
-                if attempt % len(GEMINI_API_KEYS) == 0:
-                    # All keys tried once — sleep before next round
-                    wait = 65
-                    print(f"  [embed] All keys rate-limited. Sleeping {wait}s before retry...")
-                    time.sleep(wait)
+            try:
+                vec = _embed_single(text, current_key)
+                vecs.append(vec)
+                success = True
+                if (i + 1) % 10 == 0 or (i + 1) == len(texts):
+                    print(f"  [embed] {i + 1}/{len(texts)} texts embedded ({key_label})")
+                time.sleep(0.1)  # small delay to avoid hitting per-minute quota
+                break
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status == 429:
+                    attempt += 1
+                    key_index += 1
+                    next_key_label = f"Key {(key_index % len(GEMINI_API_KEYS)) + 1}/{len(GEMINI_API_KEYS)}"
+                    if attempt % len(GEMINI_API_KEYS) == 0:
+                        wait = 65
+                        print(f"  [embed] All keys rate-limited. Sleeping {wait}s before retry...")
+                        time.sleep(wait)
+                    else:
+                        print(f"  [embed] {key_label} rate-limited → switching to {next_key_label}")
                 else:
-                    print(f"  [embed] {key_label} rate-limited → switching to {next_key_label}")
-                continue
-
-            resp.raise_for_status()
-            data = resp.json()
-            for embedding_obj in data.get("embeddings", []):
-                vecs.append(embedding_obj["values"])
-
-            success = True
-            print(f"  [embed] {min(i + batch_size, len(texts))}/{len(texts)} texts embedded ({key_label})")
-            time.sleep(1)  # small delay between batches
-            break
+                    raise  # non-rate-limit HTTP error — propagate immediately
 
         if not success:
-            raise RuntimeError(f"Failed to embed batch after {max_attempts} attempts across all keys.")
+            raise RuntimeError(f"Failed to embed text #{i} after {max_attempts} attempts across all keys.")
 
     if not vecs:
         raise RuntimeError("API returned no embeddings.")

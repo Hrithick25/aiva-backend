@@ -137,7 +137,7 @@ async def get_agent_response(user_query: str, language_context: Optional[Dict] =
             query_to_search = rag_query if rag_query else user_query
             rag_results = await asyncio.wait_for(
                 loop.run_in_executor(None, query_knowledge_base, query_to_search),
-                timeout=2.5  # increased from 1.5s
+                timeout=8.0  # must be comfortably above embed read timeout (10s) minus network jitter
             )
             rag_ms = (time.time() - rag_start) * 1000
             logger.info(f"⏱️ RAG retrieval took {rag_ms:.0f}ms")

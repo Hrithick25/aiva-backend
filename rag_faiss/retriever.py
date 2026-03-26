@@ -113,8 +113,12 @@ def _embed_query(text: str) -> np.ndarray:
             resp = session.post(
                 EMBED_URL,
                 params={"key": key},
-                json={"content": {"parts": [{"text": text}]}},
-                timeout=(5, 10),
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "content": {"parts": [{"text": text}]},
+                    "taskType": "RETRIEVAL_QUERY",
+                },
+                timeout=(3, 10),  # 3s connect, 10s read
             )
             if resp.status_code == 429:
                 logger.warning(f"[RETRIEVER] Key {_embed_key_idx % len(keys) + 1} rate-limited, rotating...")
