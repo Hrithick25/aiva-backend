@@ -5,11 +5,10 @@ python-dotenv
 numpy
 requests
 
-# RAG & Embeddings (Gemini API — no local model)
+# RAG & Embeddings (Gemini cloud API — no local model)
 faiss-cpu
 google-generativeai
-langchain-text-splitters
 
-# API & Audio
+# LLM & Audio
 groq
 edge-tts

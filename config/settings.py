@@ -6,13 +6,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 # Always load the backend .env from the project root.
 load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
-CHROMA_PERSIST_DIR       = os.path.join(BASE_DIR, "data", "chroma_db")
-DOCUMENT_COLLECTION_NAME = "KnowledgeDocuments"
-CHUNK_COLLECTION_NAME    = "KnowledgeChunks"
-CHUNK_RESULTS            = 3
-ROUTER_MAX_SOURCES       = 2
-ROUTER_TEXT_LIMIT        = 6000
-# Active dataset files are configured in rag_faiss/config.py
+# ── Server ────────────────────────────────────────────────────────────
 WEBSOCKET_HOST = os.getenv("HOST", "0.0.0.0")
 WEBSOCKET_PORT = int(os.getenv("PORT", "8000"))
 
@@ -37,8 +31,8 @@ AUDIO_SETTINGS = {
     "enable_audio_logging":  os.getenv("ENABLE_AUDIO_LOGGING", "false").lower() == "true",
     "audio_cache_enabled":   os.getenv("AUDIO_CACHE_ENABLED", "false").lower() == "true",
     "audio_temp_dir":        os.path.join(BASE_DIR, "temp", "audio"),
-    # Legacy keys kept for backward compat with existing endpoint references
-    "enable_key_rotation":   True,    # Groq key rotation active: GROQ_API_KEY_1/2
+    # Key rotation — Groq keys
+    "enable_key_rotation":   True,
     "api_key_rotation":      True,
 }
 

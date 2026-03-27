@@ -61,12 +61,7 @@ def _background_warmup():
         _load_faiss()
         logger.info("[STARTUP-BG] ✅ FAISS index ready")
 
-        # ── 2. Gemini embedding — cloud API, no local model to load ─────
-        _warmup_status = "verifying Gemini embedding API"
-        logger.info("[STARTUP-BG] Gemini embedding uses cloud API — no heavy model to load")
-        logger.info("[STARTUP-BG] ✅ Gemini embedding ready (cloud API)")
-
-        # ── 3. Pre-warm Groq Llama client ──────────────────────────────
+        # ── 2. Pre-warm Groq Llama client ──────────────────────────────
         _warmup_status = "initializing Groq LLM client"
         logger.info("[STARTUP-BG] Initializing Groq LLM client...")
         try:
@@ -76,7 +71,7 @@ def _background_warmup():
         except Exception as e:
             logger.warning(f"[STARTUP-BG] Groq client init failed (non-fatal): {e}")
 
-        # ── 4. Audio manager ───────────────────────────────────────────
+        # ── 3. Audio manager ───────────────────────────────────────────
         _warmup_status = "initializing audio pipeline"
         logger.info("[STARTUP-BG] Initializing audio pipeline...")
         try:
@@ -91,8 +86,9 @@ def _background_warmup():
         _warmup_complete = True
         _warmup_status = "ready"
         logger.info(
-            "[STARTUP-BG] 🚀 AIVA ready! All components pre-warmed. "
-            "First request latency: STT ~400ms | RAG ~85ms | LLM ~300ms | TTS stream ~300ms"
+            "[STARTUP-BG] 🚀 AIVA ready! "
+            "Embedding: Gemini cloud API | LLM: Groq llama-3.1-8b | "
+            "STT: Groq whisper | TTS: Edge/Sarvam"
         )
     except Exception as e:
         _warmup_status = f"error: {e}"
