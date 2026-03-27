@@ -19,10 +19,18 @@ import asyncio
 from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from agent.groq_llama_agent import get_agent_response
-from audio.manager import get_audio_manager
 
 router = APIRouter()
-audio_manager = get_audio_manager()
+
+# Lazy audio manager — avoids loading heavy audio modules at import time
+_audio_manager = None
+
+def _get_audio_manager():
+    global _audio_manager
+    if _audio_manager is None:
+        from audio.manager import get_audio_manager
+        _audio_manager = get_audio_manager()
+    return _audio_manager
 
 _ws_sessions: dict = {}
 
@@ -214,7 +222,7 @@ async def handle_text_query(ws: WebSocket, payload: dict):
         tts_lang = "ta" if is_tamil_resp else detect_language(result["response"])
         try:
             tts_result = await asyncio.wait_for(
-                audio_manager.process_text_to_audio(result["response"], tts_lang, result.get("emotion", "none")),
+                _get_audio_manager().process_text_to_audio(result["response"], tts_lang, result.get("emotion", "none")),
                 timeout=15.0,
             )
             if tts_result["success"]:
@@ -240,7 +248,7 @@ async def handle_text_query(ws: WebSocket, payload: dict):
 async def handle_binary_message(ws: WebSocket, binary_data: bytes):
     print(f"[WS] Binary audio {len(binary_data)}B")
     try:
-        result = await audio_manager.process_audio_conversation(
+        result = await _get_audio_manager().process_audio_conversation(
             binary_data,
             lambda q, lc=None: call_agent_with_history(ws, q, lc),
             input_language="en",
@@ -286,7 +294,7 @@ async def handle_audio_base64_query(ws: WebSocket, payload: dict):
         in_lang    = payload.get("input_language",  "en")
         out_lang   = payload.get("output_language", "en")
 
-        result = await audio_manager.process_audio_conversation(
+        result = await _get_audio_manager().process_audio_conversation(
             audio_data,
             lambda q, lc=None: call_agent_with_history(ws, q, lc),
             input_language=in_lang,
@@ -394,7 +402,7 @@ async def _audio_pipeline(ws: WebSocket, payload: dict):
     user_lang = _normalise_lang(raw_lang)
 
     print(f"[WS] 🎤 Audio {len(audio_data)}B lang={user_lang}")
-    mgr = get_audio_manager()
+    mgr = _get_audio_manager()
     t_pipeline = time.perf_counter()
 
     # ── STT ───────────────────────────────────────────────────────────────
@@ -544,7 +552,7 @@ async def handle_tts_streaming(ws: WebSocket, payload: dict):
             language = "en"
         emotion   = payload.get("emotion", "none")
         sentences = split_text_into_sentences(text)
-        mgr       = get_audio_manager()
+        mgr       = _get_audio_manager()
 
         for i, sentence in enumerate(sentences):
             try:
@@ -614,12 +622,12 @@ async def handle_test_immediate(ws: WebSocket, payload: dict):
 
 
 async def handle_audio_info_request(ws: WebSocket):
-    await _safe_send_json(ws, {"type": "audio_info_response", "info": audio_manager.get_supported_formats()})
+    await _safe_send_json(ws, {"type": "audio_info_response", "info": _get_audio_manager().get_supported_formats()})
 
 
 async def handle_voices_request(ws: WebSocket, payload: dict):
     language = payload.get("language", "en")
-    voices   = await audio_manager.get_voice_options(language)
+    voices   = await _get_audio_manager().get_voice_options(language)
     await _safe_send_json(ws, {"type": "voices_response", "voices": voices})
 
 

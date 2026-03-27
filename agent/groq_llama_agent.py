@@ -23,7 +23,11 @@ import time
 from typing import Dict, Any, List, Optional
 from groq import Groq
 
-from rag_faiss.retriever import retrieve as query_knowledge_base
+# LAZY import — rag_faiss.retriever triggers `import faiss` (heavy C lib).
+# If imported at module level, it blocks port binding on Render.
+def _get_retriever():
+    from rag_faiss.retriever import retrieve
+    return retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +277,7 @@ async def get_agent_response(
             rag_start = time.perf_counter()
             query_to_search = rag_query if rag_query else user_query
             rag_results = await asyncio.wait_for(
-                loop.run_in_executor(None, query_knowledge_base, query_to_search),
+                loop.run_in_executor(None, _get_retriever(), query_to_search),
                 timeout=3.0,    # BGE embed ≈82ms + FAISS ≈2ms <<< 3s
             )
             rag_ms = (time.perf_counter() - rag_start) * 1000
