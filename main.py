@@ -143,11 +143,16 @@ async def get_voices(language: str = "en"):
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"[MAIN] Starting server on {WEBSOCKET_HOST}:{WEBSOCKET_PORT}")
+    # Read PORT live from env so Render's injected $PORT is always honoured.
+    # WEBSOCKET_PORT was resolved at import time from .env and may be stale.
+    port = int(os.environ.get("PORT", "8000"))
+    host = os.environ.get("HOST", "0.0.0.0")
+    logger.info(f"[MAIN] Starting AIVA on {host}:{port}")
     uvicorn.run(
         "main:app",
-        host=WEBSOCKET_HOST,
-        port=WEBSOCKET_PORT,
-        reload=False,       # reload=False for production (reload causes double startup)
-        log_level="info"
+        host=host,
+        port=port,
+        reload=False,
+        log_level="info",
     )
+
