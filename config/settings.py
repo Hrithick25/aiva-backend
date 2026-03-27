@@ -38,8 +38,8 @@ AUDIO_SETTINGS = {
     "audio_cache_enabled":   os.getenv("AUDIO_CACHE_ENABLED", "false").lower() == "true",
     "audio_temp_dir":        os.path.join(BASE_DIR, "temp", "audio"),
     # Legacy keys kept for backward compat with existing endpoint references
-    "enable_key_rotation":   False,   # Gemini key rotation removed; Groq uses single key
-    "api_key_rotation":      False,
+    "enable_key_rotation":   True,    # Groq key rotation active: GROQ_API_KEY_1/2
+    "api_key_rotation":      True,
 }
 
 # Ensure temp directory exists

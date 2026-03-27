@@ -18,6 +18,7 @@ from typing import Any, Dict
 import io
 from groq import Groq
 from audio.sarvam import transcribe_tamil, is_configured as sarvam_configured
+from agent.groq_llama_agent import _key_manager as _groq_key_manager
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +39,11 @@ class STTProcessor:
     _HINDI_CODES  = {"hi", "hindi"}
 
     def __init__(self):
-        self._client      = None
-        self._current_key = None
+        pass   # Groq clients are managed by the shared _groq_key_manager
 
     def _get_client(self) -> Groq:
-        import os
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise Exception("No Groq API key available")
-        if self._client is None or api_key != self._current_key:
-            self._client      = Groq(api_key=api_key)
-            self._current_key = api_key
-        return self._client
+        """Return the currently active Groq client (may rotate on 429)."""
+        return _groq_key_manager.current_client()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -129,98 +123,110 @@ class STTProcessor:
         return normalized if normalized in self._SUPPORTED_LANGUAGES else "en"
 
     def _transcribe_bytes(self, audio_data: bytes, language: str = "auto") -> Dict[str, Any]:
-        """Groq Whisper-large-v3 transcription (single pass, auto language detection)."""
-        try:
-            client = self._get_client()
+        """Groq Whisper-large-v3 transcription with automatic key rotation on 429."""
+        detected_format = self._sniff_audio_format(audio_data)
+        ext_map = {
+            "wav": "wav", "mp3": "mp3", "ogg": "ogg",
+            "flac": "flac", "m4a": "m4a", "webm": "webm", "unknown": "wav",
+        }
+        ext             = ext_map.get(detected_format, "wav")
+        normalized_lang = self._normalize_language(language)
 
-            detected_format = self._sniff_audio_format(audio_data)
-            ext_map = {
-                "wav": "wav", "mp3": "mp3", "ogg": "ogg",
-                "flac": "flac", "m4a": "m4a", "webm": "webm", "unknown": "wav",
-            }
-            ext        = ext_map.get(detected_format, "wav")
-            audio_file = io.BytesIO(audio_data)
-            audio_file.name = f"audio.{ext}"
+        n_keys  = max(1, len(_groq_key_manager._keys) if _groq_key_manager._keys else 1)
+        rotated = 0
+        transcript_text   = ""
+        detected_language = "en"
 
-            normalized_lang = self._normalize_language(language)
-            kwargs: Dict[str, Any] = {
-                "file":            audio_file,
-                "model":           "whisper-large-v3-turbo",  # 4x faster than v3 for English
-                "response_format": "verbose_json",
-                "temperature":     0.0,
-            }
+        while True:
+            try:
+                audio_file = io.BytesIO(audio_data)
+                audio_file.name = f"audio.{ext}"
+                client = self._get_client()
+                kwargs: Dict[str, Any] = {
+                    "file":            audio_file,
+                    "model":           "whisper-large-v3-turbo",
+                    "response_format": "verbose_json",
+                    "temperature":     0.0,
+                }
+                if language != "auto" and normalized_lang in self._SUPPORTED_LANGUAGES:
+                    kwargs["language"] = normalized_lang
+                    logger.info(f"[STT] Forced language: {normalized_lang}")
+                else:
+                    logger.info("[STT] Auto language detection")
 
-            # Force language if explicitly requested (not auto)
-            if language != "auto" and normalized_lang in self._SUPPORTED_LANGUAGES:
-                kwargs["language"] = normalized_lang
-                logger.info(f"[STT] Forced language: {normalized_lang}")
-            else:
-                logger.info("[STT] Auto language detection")
+                resp              = client.audio.transcriptions.create(**kwargs)
+                transcript_text   = resp.text or ""
+                detected_language = (getattr(resp, "language", None) or "en").strip().lower()
+                break   # success — exit retry loop
 
-            resp            = client.audio.transcriptions.create(**kwargs)
-            transcript_text = resp.text or ""
-            detected_language = (getattr(resp, "language", None) or "en").strip().lower()
+            except Exception as error:
+                err_str = str(error).lower()
+                if ("rate" in err_str or "429" in err_str) and rotated < n_keys - 1:
+                    logger.warning(
+                        f"[STT] Whisper rate-limited on key #{_groq_key_manager._index + 1}, rotating…"
+                    )
+                    if _groq_key_manager.rotate():
+                        rotated += 1
+                        continue
+                logger.error(f"Groq transcription failed: {error}")
+                raise
 
-            # ── Language override checks ──────────────────────────────────
-            is_tamil_input = detected_language in self._TAMIL_CODES
-            is_hindi_input = detected_language in self._HINDI_CODES
+        # ── Language override checks ──────────────────────────────────────────
+        is_tamil_input = detected_language in self._TAMIL_CODES
+        is_hindi_input = detected_language in self._HINDI_CODES
 
-            # Tamil Unicode chars
-            if not is_tamil_input:
-                if any('\u0b80' <= c <= '\u0bff' for c in transcript_text):
-                    is_tamil_input    = True
-                    detected_language = "ta"
+        # Tamil Unicode chars
+        if not is_tamil_input:
+            if any('\u0b80' <= c <= '\u0bff' for c in transcript_text):
+                is_tamil_input    = True
+                detected_language = "ta"
 
-            # Tanglish signature words (code-switching mis-labeled as English)
-            if not is_tamil_input:
-                words = set(transcript_text.lower().split())
-                if words & _TANGLISH_SIGNATURE_WORDS:
-                    is_tamil_input    = True
-                    detected_language = "ta"
-                    logger.info("[STT] Tanglish signature detected → Tamil mode")
+        # Tanglish signature words (code-switching mis-labeled as English)
+        if not is_tamil_input:
+            words = set(transcript_text.lower().split())
+            if words & _TANGLISH_SIGNATURE_WORDS:
+                is_tamil_input    = True
+                detected_language = "ta"
+                logger.info("[STT] Tanglish signature detected → Tamil mode")
 
-            # Hindi Unicode chars
-            if not is_hindi_input and not is_tamil_input:
-                if any('\u0900' <= c <= '\u097f' for c in transcript_text):
-                    is_hindi_input    = True
-                    detected_language = "hi"
+        # Hindi Unicode chars
+        if not is_hindi_input and not is_tamil_input:
+            if any('\u0900' <= c <= '\u097f' for c in transcript_text):
+                is_hindi_input    = True
+                detected_language = "hi"
 
-            final_language = (
-                "ta" if is_tamil_input else
-                "hi" if is_hindi_input else
-                "en"
-            )
-            confidence = 0.92 if (is_tamil_input or is_hindi_input) else 0.95
+        final_language = (
+            "ta" if is_tamil_input else
+            "hi" if is_hindi_input else
+            "en"
+        )
+        confidence = 0.92 if (is_tamil_input or is_hindi_input) else 0.95
 
-            logger.info(
-                f"[STT] Groq result → lang={final_language}, tamil={is_tamil_input}, "
-                f"text='{transcript_text[:60]}'"
-            )
-            return {
-                "text":              transcript_text,
-                "confidence":        confidence,
-                "language":          final_language,
-                "is_tamil":          is_tamil_input,
-                "is_hindi":          is_hindi_input,
-                "detected_language": detected_language,
-            }
-
-        except Exception as error:
-            logger.error(f"Groq transcription failed: {error}")
-            raise
+        logger.info(
+            f"[STT] Groq result → lang={final_language}, tamil={is_tamil_input}, "
+            f"text='{transcript_text[:60]}'"
+        )
+        return {
+            "text":              transcript_text,
+            "confidence":        confidence,
+            "language":          final_language,
+            "is_tamil":          is_tamil_input,
+            "is_hindi":          is_hindi_input,
+            "detected_language": detected_language,
+        }
 
     def _sniff_audio_format(self, audio_data: bytes) -> str:
         """Best-effort header sniffing for common audio containers."""
         if not audio_data or len(audio_data) < 4:
             return "unknown"
         header_map = {
-            b"RIFF":         "wav",
-            b"\xff\xfb":     "mp3",
-            b"\xff\xf3":     "mp3",
-            b"\xff\xf2":     "mp3",
-            b"OggS":         "ogg",
-            b"fLaC":         "flac",
-            b"ftypM4A":      "m4a",
+            b"RIFF":             "wav",
+            b"\xff\xfb":         "mp3",
+            b"\xff\xf3":         "mp3",
+            b"\xff\xf2":         "mp3",
+            b"OggS":             "ogg",
+            b"fLaC":             "flac",
+            b"ftypM4A":          "m4a",
             b"\x1a\x45\xdf\xa3": "webm",
         }
         for header, fmt in header_map.items():

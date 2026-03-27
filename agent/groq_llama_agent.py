@@ -9,7 +9,8 @@ Key optimizations:
   - RAG timeout: 3s (was 8s — BGE embed is ~82ms, no need for 8s)
   - Context: max 600 chars fed to LLM (was uncapped)
   - History: max 3 turns, truncated eagerly
-  - Groq client: persistent singleton (no per-request init)
+  - Groq client: persistent singleton per key (no per-request init)
+  - Key rotation: GROQ_API_KEY_1 → GROQ_API_KEY_2 on 429 rate-limit
   - JSON mode: native (no post-processing)
 """
 
@@ -17,13 +18,83 @@ import os
 import json
 import asyncio
 import logging
+import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from groq import Groq
 
 from rag_faiss.retriever import retrieve as query_knowledge_base
 
 logger = logging.getLogger(__name__)
+
+
+# ── Multi-key rotation manager ────────────────────────────────────────────────
+class _GroqKeyManager:
+    """
+    Thread-safe Groq API key rotation.
+    Reads GROQ_API_KEY_1 … GROQ_API_KEY_N from env at first use.
+    Falls back to GROQ_API_KEY for backward compatibility.
+    On a 429 or rate-limit error, advances to the next key.
+    """
+
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._keys:   List[str] = []
+        self._clients: Dict[str, Groq] = {}
+        self._index   = 0
+
+    def _load_keys(self) -> List[str]:
+        """Collect all configured keys from environment."""
+        keys: List[str] = []
+        # Numbered keys: GROQ_API_KEY_1, GROQ_API_KEY_2, …
+        for i in range(1, 20):
+            val = os.getenv(f"GROQ_API_KEY_{i}", "").strip()
+            if val:
+                keys.append(val)
+            else:
+                break   # stop at first gap
+        # Fallback: plain GROQ_API_KEY
+        if not keys:
+            single = os.getenv("GROQ_API_KEY", "").strip()
+            if single:
+                keys.append(single)
+        if not keys:
+            raise RuntimeError(
+                "No Groq API key found. Set GROQ_API_KEY_1 (and optionally GROQ_API_KEY_2 …) in .env"
+            )
+        return keys
+
+    def _ensure_loaded(self):
+        if not self._keys:
+            self._keys = self._load_keys()
+            logger.info(f"[GroqKeyManager] Loaded {len(self._keys)} key(s)")
+
+    def current_client(self) -> Groq:
+        with self._lock:
+            self._ensure_loaded()
+            key = self._keys[self._index]
+            if key not in self._clients:
+                self._clients[key] = Groq(api_key=key)
+            return self._clients[key]
+
+    def rotate(self) -> bool:
+        """Advance to next key. Returns True if a new key is available."""
+        with self._lock:
+            self._ensure_loaded()
+            if len(self._keys) <= 1:
+                logger.warning("[GroqKeyManager] Only 1 key configured — cannot rotate")
+                return False
+            next_idx = (self._index + 1) % len(self._keys)
+            if next_idx == self._index:   # wrapped all the way around
+                return False
+            self._index = next_idx
+            logger.warning(
+                f"[GroqKeyManager] 🔄 Rotated to key #{self._index + 1} / {len(self._keys)}"
+            )
+            return True
+
+
+_key_manager = _GroqKeyManager()
 
 SYSTEM_PROMPT = """You are AIVA, the AI virtual assistant for Sri Eshwar College of Engineering (SECE).
 STRICT RULE: Only use facts present in the provided context. Never hallucinate or infer data not in the context.
@@ -121,21 +192,10 @@ RULE 7 — Tanglish Response Mode (activated when user speaks Tamil):
 RESPOND ONLY in valid JSON with no extra keys:
 {"response": "<formatted answer>", "emotion": "<happy|sad|none>"}"""
 
-# ── Persistent Groq client (shared across all requests) ───────────────────────
-_groq_client: Optional[Groq] = None
-_groq_client_key: Optional[str] = None
-
-
+# ── Groq client accessor (delegates to rotation manager) ─────────────────────
 def _get_groq_client() -> Groq:
-    """Return the cached Groq client — only re-creates if the API key changes."""
-    global _groq_client, _groq_client_key
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise Exception("GROQ_API_KEY not found in environment")
-    if _groq_client is None or api_key != _groq_client_key:
-        _groq_client = Groq(api_key=api_key)
-        _groq_client_key = api_key
-    return _groq_client
+    """Return the currently active Groq client from the key manager."""
+    return _key_manager.current_client()
 
 
 # ── Fast synchronous LLM call (runs in executor) ──────────────────────────────
@@ -145,10 +205,12 @@ def _call_llm_sync(user_content: str) -> str:
     System prompt sent as 'system' role (processed separately by Groq).
     Retries once on rate-limit (429). Hard timeout enforced by caller.
     """
-    import time as _t
-    client = _get_groq_client()
-    for attempt in range(2):
+    # Try every available key once before giving up
+    n_keys  = max(1, len(_key_manager._keys) if _key_manager._keys else 1)
+    rotated = 0
+    while True:
         try:
+            client   = _get_groq_client()
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
@@ -164,13 +226,13 @@ def _call_llm_sync(user_content: str) -> str:
             return response.choices[0].message.content.strip()
         except Exception as e:
             err_str = str(e).lower()
-            if "rate" in err_str or "429" in err_str:
-                if attempt == 0:
-                    logger.warning("[LLM] Rate-limited, retrying in 200ms...")
-                    _t.sleep(0.2)
-                    continue
-            raise  # non-rate-limit errors propagate immediately
-    raise RuntimeError("[LLM] Max retries exceeded")
+            if ("rate" in err_str or "429" in err_str) and rotated < n_keys - 1:
+                logger.warning(f"[LLM] Rate-limited on key #{_key_manager._index + 1}, rotating…")
+                if _key_manager.rotate():
+                    rotated += 1
+                    continue   # retry immediately with new key
+            raise   # non-rate-limit errors or all keys exhausted
+    raise RuntimeError("[LLM] All Groq keys exhausted")
 
 
 async def get_agent_response(
